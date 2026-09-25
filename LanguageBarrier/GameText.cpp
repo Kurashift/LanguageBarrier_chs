@@ -1,6 +1,8 @@
 ﻿#include "GameText.h"
 #include <fstream>
 #include <list>
+#include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 #include <intrin.h>
@@ -34,8 +36,7 @@ typedef struct {
   int curColor;
   int usedLineLength;
   bool error;
-  wchar_t text[lb::MAX_PROCESSED_STRING_LENGTH];
-  wchar_t textutf16[lb::MAX_PROCESSED_STRING_LENGTH];
+  char text[lb::MAX_PROCESSED_STRING_LENGTH];
 } ProcessedSc3String_t;
 
 // also my own
@@ -54,6 +55,66 @@ typedef struct __declspec(align(4)) {
   int displayWidth;
   int displayHeight;
 } LinkMetrics_t;
+
+struct DialogueRubyBaseGlyph {
+  float x;
+  float advance;
+  wchar_t ch;
+};
+
+#include "RubyBaseTable.inc"
+
+// Whitespace-insensitive equality for ruby text.
+//
+// The table keys are written by the generator with whitespace stripped, while
+// the draw hook reassembles the annotation straight from the page arrays --
+// where a space is a real glyph (charset entry 0) and survives. Comparing the
+// raw strings therefore never matched, and every lookup fell through to the
+// old rule with nothing to show for it. Normalising both sides here keeps the
+// two in step no matter how either side is spelled.
+static bool rubyTextEquals(const wchar_t* a, const wchar_t* b) {
+  for (;;) {
+    while (*a == L' ' || *a == L'\t' || *a == 0x3000) a++;
+    while (*b == L' ' || *b == L'\t' || *b == 0x3000) b++;
+    if (*a == L'\0' || *b == L'\0') return *a == *b;
+    if (*a != *b) return false;
+    a++;
+    b++;
+  }
+}
+
+// Length of the base run that a dialogue ruby annotation sits over, or -1 when
+// the table has nothing to say about this pair.
+//
+// The page arrays reach this file without ruby markers, so the base run is
+// recovered from geometry: the run is the tail of the preceding line, and the
+// table lists the base text for the annotations whose character count differs
+// from it (those are the pairs the count rule gets wrong). Longest suffix wins
+// so a short candidate cannot shadow a longer one that also matches.
+//
+// Returns the length in UTF-16 code units; callers compare it against the
+// glyph count, and every entry in the table is BMP-only.
+static int rubyBaseRunLength(const std::vector<DialogueRubyBaseGlyph>& baseRun,
+                             const wchar_t* rubyText) {
+  if (RUBY_BASE_ENTRY_COUNT == 0 || rubyText == NULL || *rubyText == L'\0')
+    return -1;
+  int best = -1;
+  for (int e = 0; e < RUBY_BASE_ENTRY_COUNT; e++) {
+    const RubyBaseEntry& entry = RUBY_BASE_ENTRIES[e];
+    if (!rubyTextEquals(entry.ruby, rubyText)) continue;
+    const int need = (int)wcslen(entry.base);
+    if (need > (int)baseRun.size() || need <= best) continue;
+    bool tail = true;
+    for (int k = 0; k < need; k++) {
+      if (baseRun[baseRun.size() - need + k].ch != entry.base[k]) {
+        tail = false;
+        break;
+      }
+    }
+    if (tail) best = need;
+  }
+  return best;
+}
 
 #define DEF_DIALOGUE_PAGE(name, size, opacityType) \
   typedef struct {                                 \
@@ -95,7 +156,6 @@ DEF_DIALOGUE_PAGE(DialoguePage_t, 2000, char);
 DEF_DIALOGUE_PAGE(CCDialoguePage_t, 600, char);
 DEF_DIALOGUE_PAGE(RNEDialoguePage_t, 2200, int16_t);
 DEF_DIALOGUE_PAGE(RNDDialoguePage_t, 600, int16_t);
-DEF_DIALOGUE_PAGE(SGMDEDialoguePage_t, 7000, char);
 
 typedef void(__cdecl* DrawDialogueProc)(int fontNumber, int pageNumber,
                                         int opacity, int xOffset, int yOffset);
@@ -116,9 +176,6 @@ typedef int(__cdecl* rnDrawTextHookProc)(signed int textureId, int a2,
 static rnDrawTextHookProc rnDrawText = NULL;
 static rnDrawTextHookProc rnDrawTextReal = NULL;
 
-static rnDrawTextHookProc sgpDrawText = NULL;
-static rnDrawTextHookProc sgpDrawTextReal = NULL;
-
 struct MultiplierData {
   float xOffset = 1.0f;
   float yOffset = 1.0f;
@@ -137,7 +194,6 @@ int __cdecl gslFillHook(int id, int a1, int a2, int a3, int a4, int r, int g,
 static uintptr_t gameExeRenderMode = NULL;
 static uintptr_t gameExeShaderPtr = NULL;
 static uintptr_t gameExeBlendMode = NULL;
-static int* gameExeLanguage = NULL;
 
 std::string gameId;
 
@@ -190,20 +246,10 @@ typedef int(__cdecl* DrawGlyphProc)(int textureId, float glyphInTextureStartX,
 static DrawGlyphProc gameExeDrawGlyph = NULL;  // = (DrawGlyphProc)0x42F950;
 static DrawGlyphProc gameExeDrawGlyphReal = NULL;
 
-typedef int(__cdecl* DrawLbpGlyphMaskProc)(
-    int textureId, int a2, float glyphInTextureStartX,
-    float glyphInTextureStartY, float glyphInTextureWidth,
-    float glyphInTextureHeight, float a7, float a8, float a9, float a10,
-    float a11, float a12, signed int inColor, signed int opacity);
-
-static DrawLbpGlyphMaskProc gameExeDrawLbpGlyphMask =
-    NULL;  // = (DrawGlyphProc)0x42F950;
-static DrawLbpGlyphMaskProc gameExeDrawLbpGlyphMaskReal = NULL;
-
 typedef unsigned int(__cdecl* Sg0DrawGlyph3Proc)(
-    int textureId, int maskTextureId, float textureStartX, float textureStartY,
-    float textureSizeX, float textureSizeY, float startPosX, float startPosY,
-    float EndPosX, float EndPosY, int color, int opacity);
+    int textureId, int maskTextureId, int textureStartX, int textureStartY,
+    int textureSizeX, int textureSizeY, int startPosX, int startPosY,
+    int EndPosX, int EndPosY, int color, int opacity);
 static Sg0DrawGlyph3Proc gameExeSg0DrawGlyph3 = NULL;
 static Sg0DrawGlyph3Proc gameExeSg0DrawGlyph3Real = NULL;
 
@@ -350,11 +396,6 @@ static uintptr_t gameExeDialogueLayoutWidthLookup3Return = NULL;
 static uintptr_t gameExeTipsListWidthLookup = NULL;
 static uintptr_t gameExeTipsListWidthLookupReturn = NULL;
 
-static uintptr_t gameExePhoneMouseFix = NULL;
-static uintptr_t gameExePhoneMouseFixHookJmp1 = NULL;
-static uintptr_t gameExePhoneMouseFixHookJmp2 = NULL;
-static uintptr_t gameExePhoneMouseFixHookJmp3 = NULL;
-
 typedef struct {
   int dx, dy;
   int fontSize;
@@ -368,16 +409,33 @@ typedef struct {
 } SpriteFix_t;
 static std::map<uintptr_t, SpriteFix_t> retAddrToSpriteFixes;
 
+// drawTwipoContent draws more than Twipo: the phone mail header reuses it for
+// its field captions ("Subject"/"Sender"/"Received") and for the date block.
+// The captions sit at a hard-coded x, but the date block is right-anchored, so
+// a translation that widens the date walks left into the caption. Keyed by
+// return address so each call site can be nudged on its own.
+typedef struct {
+  int dx;
+} TwipoContentOffset_t;
+static std::map<uintptr_t, TwipoContentOffset_t> retAddrToTwipoContentFixes;
+
+// The mail date is drawn right-to-left from one shared buffer: the game formats
+// a number with FormatNumber, measures that buffer, then draws it. The English
+// layout emits day/month as bare numbers ("9/2") with no day marker, so a
+// Chinese date has to grow a trailing "日".
+//
+// The marker is added from the width hook (see appendMailDayMarker), which runs
+// on the same buffer the draw will read, so the extra cell is both reserved in
+// the layout and painted.
+static uintptr_t gameExeMailDayMeasureRet = NULL;
+static bool MAIL_DAY_MARKER = false;
+
 static uintptr_t gameExeCcBacklogNamePosCode = NULL;       // = 0x00454FE9
 static uintptr_t gameExeCcBacklogNamePosAdjustRet = NULL;  // = 0x00454FEF
 
 static uint8_t* gameExeGlyphWidthsFont1 = NULL;       // = (uint8_t *)0x52C7F0;
 static uint8_t* gameExeGlyphWidthsFont2 = NULL;       // = (uint8_t *)0x52E058;
 static int* gameExeColors = NULL;                     // = (int *)0x52E1E8;
-static uint8_t* gameExeLookUpTable = NULL;                     // = (int *)0x52E1E8;
-
-
-
 static int8_t* gameExeBacklogHighlightHeight = NULL;  // = (int8_t *)0x435DD4;
 
 static int* gameExeCcBacklogCurLine =
@@ -427,46 +485,6 @@ __declspec(naked) void tipsListWidthLookupHook() {
   }
 }
 
-__declspec(naked) void gameExePhoneMouseFixHook() {
-  _asm {
-             push    ebx
-             mov     ebx, [edx+6A88h]
-             mov     ecx, [edx+6A8Ch]
-             cmp     ecx, 0Ch
-             jbe     short skip
-             add     ecx, 0FFFFFFF4h
-             cmp     ebx, ecx
-             jnb     short skip
-             lea     eax, [ebx+1]
-             mov     [edx+6A88h], eax
-             pop ebx
-             jmp gameExePhoneMouseFixHookJmp1
-             skip:
-             pop ebx
-             jmp gameExePhoneMouseFixHookJmp2
-
-  }
-}
-
-__declspec(naked) void gameExePhoneMouseFix2Hook() {
-  _asm {
-             push    ebx
-             mov     ebx, [edx+6A88h]
-             mov     ecx, [edx+6A8Ch]
-             cmp     ecx, 0Ch
-             jbe     short skip
-             add     ecx, 0FFFFFFF4h
-             cmp     ebx, ecx
-             jnb     short skip
-             lea     eax, [ebx+1]
-             mov     [edx+6A88h], eax
-             skip:
-             pop ebx
-             jmp gameExePhoneMouseFixHookJmp3
-
-  }
-}
-
 __declspec(naked) void ccBacklogNamePosAdjustHook() {
   __asm {
     // copied code
@@ -509,10 +527,6 @@ namespace lb {
 void __cdecl drawDialogueHook(int fontNumber, int pageNumber, uint32_t opacity,
                               int xOffset, int yOffset);
 void __cdecl drawDialogue2Hook(int fontNumber, int pageNumber,
-                               uint32_t opacity);
-void __cdecl sgmdeDrawDialogueHook(int fontNumber, int pageNumber, uint32_t opacity,
-                              int xOffset, int yOffset);
-void __cdecl sgmdeDrawDialogue2Hook(int fontNumber, int pageNumber,
                                uint32_t opacity);
 void __cdecl ccDrawDialogueHook(int fontNumber, int pageNumber,
                                 uint32_t opacity, int xOffset, int yOffset);
@@ -589,9 +603,9 @@ unsigned int __cdecl sg0DrawGlyph2Hook(int textureId, int a2,
                                        float a8, float a9, float a10, float a11,
                                        float a12, signed int inColor,
                                        signed int opacity, int* a15, int* a16);
-unsigned int sg0DrawGlyph3Hook(int textureId, int a2, float a3, float a4,
-                               float a5, float a6, float a7, float a8, float a9,
-                               float a10, int a11, int a12);
+unsigned int sg0DrawGlyph3Hook(int textureId, int a2, int a3, int a4, int a5,
+                               int a6, int a7, int a8, int a9, int a10, int a11,
+                               int a12);
 int __cdecl setTipContentHook(char* sc3string);
 void __cdecl drawTipContentHook(int textureId, int maskId, int startX,
                                 int startY, int maskStartY, int maskHeight,
@@ -605,10 +619,6 @@ void drawReportContentHook(int textureId, int maskId, int a3, int a4,
 int __cdecl rnDrawTextHook(signed int textureId, int a2, signed int startY,
                            unsigned int a4, uint8_t* a5, signed int startX,
                            int color, int height, int opacity);
-
-int __cdecl sgpDrawTextHook(signed int textureId, int a2, signed int startY,
-                            unsigned int a4, uint8_t* a5, signed int startX,
-                            int color, int height, int opacity);
 void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
                                        int startX, int startY,
                                        unsigned int maskY, int maskHeight,
@@ -669,6 +679,8 @@ int __cdecl gslFillHook(int id, int a1, int a2, int a3, int a4, int r, int g,
 // (which some functions do, and others don't, except for symbols (also used in
 // Western translations) it considers full-width)
 
+enum GameID { CC, SG, SG0, RNE, RND };
+
 GameID currentGame;
 bool UseNewTextSystem = false;
 
@@ -679,13 +691,18 @@ void gameTextInit() {
     } else if (config["gamedef"]["dialoguePageVersion"].get<std::string>() ==
                "rnd") {
       currentGame = RND;
-    } else if (config["gamedef"]["dialoguePageVersion"].get<std::string>() ==
-               "sgmde") {
-      currentGame = SGMDE;
     }
   }
   if (config["patch"].count("useNewTextSystem") == 1)
     UseNewTextSystem = config["patch"]["useNewTextSystem"].get<bool>();
+
+  RUBY_MARKERS_ENABLED = false;
+  if (config["patch"].count("rubyMarkers") == 1)
+    RUBY_MARKERS_ENABLED = config["patch"]["rubyMarkers"].get<bool>();
+
+  CJK_LINE_BREAK = false;
+  if (config["patch"].count("cjkLineBreak") == 1)
+    CJK_LINE_BREAK = config["patch"]["cjkLineBreak"].get<bool>();
 
   if (currentGame == RNE || currentGame == RND) {
     fixLeadingZeroes();
@@ -699,22 +716,6 @@ void gameTextInit() {
 
   if (currentGame == RNE) {
     fixSkipRN();
-  }
-
-  const char** chapterNameTable =
-      (const char**)sigScan("game", "useOfChapterNameTable");
-  if (chapterNameTable != nullptr) {
-    static std::vector<std::string> chapterNamesReplacement;
-    try {
-      chapterNamesReplacement =
-          config["patch"]["chapterNames"].get<std::vector<std::string>>();
-    } catch (const std::exception& e) {
-      std::cerr << "Error loading chapter names: " << e.what() << std::endl;
-    }
-
-    for (int i = 0; i < chapterNamesReplacement.size(); i++) {
-      chapterNameTable[i] = chapterNamesReplacement[i].c_str();
-    }
   }
 
   if (currentGame != RNE && currentGame != RND) {
@@ -785,36 +786,6 @@ void gameTextInit() {
   } else {
     // TODO (?): Split font support for non-sg0 drawGlyph
     gameExeDrawGlyph = (DrawGlyphProc)sigScan("game", "drawGlyph");
-
-    scanCreateEnableHook("game", "drawGlyph", (uintptr_t*)&gameExeDrawGlyph,
-                         (LPVOID)sg0DrawGlyphHook,
-                         (LPVOID*)&gameExeDrawGlyphReal);
-
-    if (config["gamedef"]["drawGlyphVersion"].get<std::string>() == "sglbp") {
-      if(currentGame!= SGMDE) currentGame = SGLBP;
-      gameExeDrawLbpGlyphMask =
-          (DrawLbpGlyphMaskProc)sigScan("game", "lbpDrawGlyph2");
-    }
-
-    scanCreateEnableHook(
-        "game", "sg0DrawGlyph3", (uintptr_t*)&gameExeSg0DrawGlyph3,
-        (LPVOID)sg0DrawGlyph3Hook, (LPVOID*)&gameExeSg0DrawGlyph3Real);
-
-    uintptr_t gameExeSgpDrawMailTextHook;
-    scanCreateEnableHook("game", "sgpDrawMailText",
-                         (uintptr_t*)&gameExeSgpDrawMailTextHook,
-                         (LPVOID)sgpDrawMailTextHook, nullptr);
-
-    uintptr_t gameExeSgpDrawMailTextContentHook;
-    scanCreateEnableHook("game", "sgpDrawMailTextContent",
-                         (uintptr_t*)&gameExeSgpDrawMailTextContentHook,
-                         (LPVOID)sgpDrawMailTextContentHook, nullptr);
-
-        uintptr_t gameExesgmdeDrawTextAsciiHook;
-    scanCreateEnableHook("game", "sgmdeDrawTextAscii",
-                             (uintptr_t*)&gameExesgmdeDrawTextAsciiHook,
-                             (LPVOID)sgmdeDrawTextAsciiHook, nullptr);
-
   }
   gameExeDrawRectangle = (DrawRectangleProc)sigScan("game", "drawRectangle");
 
@@ -849,7 +820,6 @@ void gameTextInit() {
   gameExeGlyphWidthsFont1 = (uint8_t*)sigScan("game", "useOfGlyphWidthsFont1");
   gameExeGlyphWidthsFont2 = (uint8_t*)sigScan("game", "useOfGlyphWidthsFont2");
   gameExeColors = (int*)sigScan("game", "useOfColors");
-  gameExeLookUpTable = (uint8_t*)sigScan("game", "sgmdeLookUpCharTable");
 
   scanCreateEnableHook("game", "gslFill", (uintptr_t*)&gameExegslFill,
                        (LPVOID)&gslFillHook, (LPVOID*)&gameExegslFillReal);
@@ -915,7 +885,7 @@ void gameTextInit() {
                  "rn") {
     gameExeDialoguePages_RNEDialoguePage_t =
         (RNEDialoguePage_t*)sigScan("game", "useOfDialoguePages");
-    SurfaceWrapper::game = RNE;
+    SurfaceWrapper::game = 0;
 
     scanCreateEnableHook(
         "game", "drawDialogue", (uintptr_t*)&gameExeDrawDialogue,
@@ -930,7 +900,7 @@ void gameTextInit() {
   } else if (config["gamedef"].count("dialoguePageVersion") == 1 &&
              config["gamedef"]["dialoguePageVersion"].get<std::string>() ==
                  "rnd") {
-    SurfaceWrapper::game = RND;
+    SurfaceWrapper::game = 1;
     gameExeDialoguePages_RNDDialoguePage_t =
         (RNDDialoguePage_t*)sigScan("game", "useOfDialoguePages");
     scanCreateEnableHook(
@@ -954,21 +924,7 @@ void gameTextInit() {
 
     auto call = (void*)sigScan("game", "backlogHighlight");
     memset_perms(call, INST_NOP, 3);
-  }  
-  
-  else if (config["gamedef"].count("dialoguePageVersion") == 1 &&
-           config["gamedef"]["dialoguePageVersion"].get<std::string>() ==
-               "sgmde") {
-    gameExeDialoguePages_SGMDEDialoguePage_t =
-        (SGMDEDialoguePage_t*)sigScan("game", "useOfDialoguePages");
-    scanCreateEnableHook(
-        "game", "drawDialogue", (uintptr_t*)&gameExeDrawDialogue,
-        (LPVOID)sgmdeDrawDialogueHook, (LPVOID*)&gameExeDrawDialogueReal);
-    scanCreateEnableHook(
-        "game", "drawDialogue2", (uintptr_t*)&gameExeDrawDialogue2,
-        (LPVOID)sgmdeDrawDialogue2Hook, (LPVOID*)&gameExeDrawDialogue2Real);
-  }
-  else {
+  } else {
     gameExeDialoguePages_DialoguePage_t =
         (DialoguePage_t*)sigScan("game", "useOfDialoguePages");
     if (IMPROVE_DIALOGUE_OUTLINES) {
@@ -1073,6 +1029,66 @@ void gameTextInit() {
       }
     }
   }
+  // drawTwipoContent fixes, keyed by the return address of the call site so
+  // each caller of the shared draw routine can be shifted independently.
+  TWIPO_CONTENT_DEBUG = false;
+  if (config["patch"].count("twipoContentDebug") == 1)
+    TWIPO_CONTENT_DEBUG = config["patch"]["twipoContentDebug"].get<bool>();
+  const auto& twipoContentFixes =
+      config["patch"].find("twipoContentFixes");
+  if (twipoContentFixes != config["patch"].end() &&
+      twipoContentFixes->is_array()) {
+    for (const json& item : *twipoContentFixes) {
+      if (!item.is_object()) continue;
+      auto sigNameIter = item.find("sigName");
+      if (sigNameIter == item.end() || !sigNameIter->is_string()) continue;
+      uintptr_t targetPtr = sigScan("game", sigNameIter->get<std::string>().c_str());
+      if (!targetPtr) continue;
+      TwipoContentOffset_t& fix = retAddrToTwipoContentFixes[targetPtr];
+      auto dxIter = item.find("dx");
+      fix.dx = (dxIter != item.end() && dxIter->is_number_integer())
+                   ? dxIter->get<int>()
+                   : 0;
+    }
+  }
+  // The English mail layout has no day marker, so a Chinese date has to grow
+  // one. Defaults on for this patch; mailDayMarker=false restores "9/2".
+  MAIL_DAY_MARKER = true;
+  if (config["patch"].count("mailDayMarker") == 1)
+    MAIL_DAY_MARKER = config["patch"]["mailDayMarker"].get<bool>();
+  if (MAIL_DAY_MARKER) {
+    gameExeMailDayMeasureRet = sigScan("game", "mailDayMeasure");
+    if (!gameExeMailDayMeasureRet) {
+      MAIL_DAY_MARKER = false;
+      LanguageBarrierLog(
+          "mailDayMarker: signature not found, leaving the date as-is");
+    }
+  }
+  // The mail header picks a field's value x from two hard-coded literals by
+  // game language: Japanese -> push 0x71 (113), English -> push 0x99 (153).
+  // The Japanese one sits 60 units further left, which reads as cramped against
+  // the 2-character "主题" caption, so the two versions disagree.
+  //
+  // Force the English literal by turning the selecting jne into a jmp: both are
+  // 2-byte forms (75 rel8 / EB rel8) taking the same rel8, so this is a
+  // same-length, single-byte overwrite and the layout becomes language
+  // independent. That lets the dx table below carry one entry per site instead
+  // of one per (site, language) pair.
+  //
+  // Rewriting the Japanese literal instead does NOT work: it is a push imm8,
+  // whose operand is signed, so 0x99 would mean -103 and push the value off the
+  // left edge of the panel.
+  {
+    static const char* const kJpBranchSigs[] = {
+        "mailHeaderSubjectValueJpBranch",
+        "mailHeaderSenderValueJpBranch",
+    };
+    for (size_t i = 0; i < sizeof(kJpBranchSigs) / sizeof(*kJpBranchSigs); i++) {
+      unsigned char* ptr = (unsigned char*)sigScan("game", kJpBranchSigs[i]);
+      if (!ptr) continue;
+      if (ptr[0] == 0x75) memset_perms(ptr, 0xEB, 1);
+    }
+  }
   if (NEEDS_CC_BACKLOG_NAME_POS_ADJUST) {
     gameExeCcBacklogNamePosAdjustRet =
         sigScan("game", "ccBacklogNamePosAdjustRet");
@@ -1091,7 +1107,7 @@ void gameTextInit() {
   // The following both have the same pattern and 'occurrence: 0' in the
   // signatures.json.
   // That's because after you hook one, the first match goes away.
-   scanCreateEnableHook("game", "getSc3StringDisplayWidthFont1",
+  scanCreateEnableHook("game", "getSc3StringDisplayWidthFont1",
                        (uintptr_t*)&gameExeGetSc3StringDisplayWidthFont1,
                        (LPVOID)getSc3StringDisplayWidthHook,
                        (LPVOID*)&gameExeGetSc3StringDisplayWidthFont1Real);
@@ -1130,7 +1146,7 @@ void gameTextInit() {
         "game", "drawTipContent", (uintptr_t*)&gameExeDrawTipContent,
         (LPVOID)drawTipContentHook, (LPVOID*)&gameExeDrawTipContentReal);
   }
-  if (CC_BACKLOG_HIGHLIGHT || !retAddrToSpriteFixes.empty()) {
+  if (CC_BACKLOG_HIGHLIGHT || !retAddrToSpriteFixes.empty() || SPRITE_DEBUG) {
     scanCreateEnableHook("game", "drawSprite", (uintptr_t*)&gameExeDrawSprite,
                          (LPVOID)drawSpriteHook,
                          (LPVOID*)&gameExeDrawSpriteReal);
@@ -1175,22 +1191,19 @@ void gameTextInit() {
                        &gameExeDialogueLayoutWidthLookup1,
                        dialogueLayoutWidthLookup1Hook, NULL);
   // we should have used the expression parser for these but oh well
-  gameExeDialogueLayoutWidthLookup1Return =
-      (uintptr_t)((uint8_t*)gameExeDialogueLayoutWidthLookup1 +
-                  lookup1retoffset);
+  gameExeDialogueLayoutWidthLookup1Return = (uintptr_t)(
+      (uint8_t*)gameExeDialogueLayoutWidthLookup1 + lookup1retoffset);
   scanCreateEnableHook("game", "dialogueLayoutWidthLookup2",
                        &gameExeDialogueLayoutWidthLookup2,
                        dialogueLayoutWidthLookup2Hook, NULL);
-  gameExeDialogueLayoutWidthLookup2Return =
-      (uintptr_t)((uint8_t*)gameExeDialogueLayoutWidthLookup2 +
-                  lookup2retoffset);
+  gameExeDialogueLayoutWidthLookup2Return = (uintptr_t)(
+      (uint8_t*)gameExeDialogueLayoutWidthLookup2 + lookup2retoffset);
   if (currentGame != RNE && currentGame != RND) {
     scanCreateEnableHook("game", "dialogueLayoutWidthLookup3",
                          &gameExeDialogueLayoutWidthLookup3,
                          dialogueLayoutWidthLookup3Hook, NULL);
-    gameExeDialogueLayoutWidthLookup3Return =
-        (uintptr_t)((uint8_t*)gameExeDialogueLayoutWidthLookup3 +
-                    lookup3retoffset);
+    gameExeDialogueLayoutWidthLookup3Return = (uintptr_t)(
+        (uint8_t*)gameExeDialogueLayoutWidthLookup3 + lookup3retoffset);
   }
   if (signatures.count("tipsListWidthLookup") == 1) {
     configretoffset = signatures["tipsListWidthLookup"].value<int>("return", 0);
@@ -1198,32 +1211,9 @@ void gameTextInit() {
     scanCreateEnableHook("game", "tipsListWidthLookup",
                          &gameExeTipsListWidthLookup, tipsListWidthLookupHook,
                          NULL);
-    gameExeTipsListWidthLookupReturn =
-        (uintptr_t)((uint8_t*)gameExeTipsListWidthLookup +
-                    tipsListWidthRetoffset);
+    gameExeTipsListWidthLookupReturn = (uintptr_t)(
+        (uint8_t*)gameExeTipsListWidthLookup + tipsListWidthRetoffset);
   }
-
-  if (signatures.count("phoneMouseFix1") == 1) {
-    int jmp1 = signatures["phoneMouseFix1"].value<int>("jmpOffset1", 0);
-    int jmp2 = signatures["phoneMouseFix1"].value<int>("jmpOffset2", 0);
-
-    scanCreateEnableHook("game", "phoneMouseFix1", &gameExePhoneMouseFix,
-                         gameExePhoneMouseFixHook, NULL);
-    gameExePhoneMouseFixHookJmp1 =
-        (uintptr_t)((uint8_t*)gameExePhoneMouseFix + jmp1);
-    gameExePhoneMouseFixHookJmp2 =
-        (uintptr_t)((uint8_t*)gameExePhoneMouseFix + jmp2);
-  }
-
-  if (signatures.count("phoneMouseFix2") == 1) {
-    int jmp1 = signatures["phoneMouseFix2"].value<int>("jmpOffset1", 0);
-
-    scanCreateEnableHook("game", "phoneMouseFix2", &gameExePhoneMouseFix,
-                         gameExePhoneMouseFix2Hook, NULL);
-    gameExePhoneMouseFixHookJmp3 =
-        (uintptr_t)((uint8_t*)gameExePhoneMouseFix + jmp1);
-  }
-
   if (signatures.count("getRineInputRectangle") == 1) {
     scanCreateEnableHook("game", "getRineInputRectangle",
                          (uintptr_t*)&gameExeGetRineInputRectangle,
@@ -1249,7 +1239,6 @@ void gameTextInit() {
     TextRendering::Get().Init(gameExeGlyphWidthsFont1, gameExeGlyphWidthsFont2,
                               (FontDataLanguage)*gameExeLanguage);
   } else {
-    TextRendering::Get().LoadCharset();
     FILE* widthsfile = fopen("languagebarrier\\widths.bin", "rb");
     fread(widths, 1, TOTAL_NUM_FONT_CELLS, widthsfile);
     fclose(widthsfile);
@@ -1365,30 +1354,122 @@ int __cdecl dialogueLayoutRelatedHook(int unk0, int* unk1, int* unk2, int unk3,
       return gameExeDrawDialogueReal(fontNumber, pageNumber, opacity, xOffset, \
                                      yOffset);                                 \
                                                                                \
-    bool newline = true;                                                       \
-    float displayStartX =                                                      \
-        (page->charDisplayX[0] + xOffset) * COORDS_MULTIPLIER;                 \
+    std::map<int, float> nextXByLine;                                          \
+    std::vector<DialogueRubyBaseGlyph> currentBaseRun;                         \
+    std::vector<float> rubyRunPositions;                                       \
+    int lastBaseY = 0;                                                         \
+    int rubyRunY = 0;                                                          \
+    int rubyRunEnd = -1;                                                       \
+    int rubyRunPositionIndex = 0;                                              \
+    bool hasBaseY = false;                                                     \
+    float displayStartX = 0.0f;                                                \
     float displayStartY =                                                      \
         (page->charDisplayY[0] + yOffset) * COORDS_MULTIPLIER;                 \
     for (int i = 0; i < page->pageLength; i++) {                               \
       if (fontNumber == page->fontNumber[i]) {                                 \
         int glyphSize = page->glyphDisplayHeight[i];                           \
-        if (i == 0 ||                                                          \
-            i > 0 && page->charDisplayY[i] != page->charDisplayY[i - 1]) {     \
-          newline = true;                                                      \
-        } else                                                                 \
-          newline = false;                                                     \
-                                                                               \
-        if (newline == false) {                                                \
-          __int16 fontSize = page->glyphDisplayHeight[i] * 1.5f;               \
-                                                                               \
-          uint32_t currentChar =                                               \
-              page->glyphCol[i - 1] +                                          \
-              page->glyphRow[i - 1] * TextRendering::Get().GLYPHS_PER_ROW;     \
-          auto glyphInfo = TextRendering::Get()                                \
-                               .getFont(fontSize, false)                       \
-                               ->getGlyphInfo(currentChar, Regular);           \
-          displayStartX += glyphInfo->advance;                                 \
+        int currentY = page->charDisplayY[i];                                  \
+        bool isRubyRun = i <= rubyRunEnd && currentY == rubyRunY;              \
+        if (!isRubyRun && hasBaseY && currentY < lastBaseY &&                  \
+            !currentBaseRun.empty()) {                                         \
+          int rubyEnd = i;                                                     \
+          while (rubyEnd < page->pageLength &&                                 \
+                 fontNumber == page->fontNumber[rubyEnd] &&                   \
+                 page->charDisplayY[rubyEnd] == currentY) {                   \
+            rubyEnd++;                                                         \
+          }                                                                    \
+          int rubyCount = rubyEnd - i;                                         \
+          std::wstring rubyText;                                               \
+          rubyText.reserve(rubyCount);                                         \
+          for (int j = 0; j < rubyCount; j++) {                               \
+            uint32_t rc = page->glyphCol[i + j] +                              \
+                          page->glyphRow[i + j] *                              \
+                              TextRendering::Get().GLYPHS_PER_ROW;             \
+            rubyText.push_back(                                                \
+                TextRendering::Get().getCharForGlyphId((int)rc));              \
+          }                                                                    \
+          const int fitLength =                                                \
+              RUBY_DIALOGUE_FIT                                                \
+                  ? rubyBaseRunLength(currentBaseRun, rubyText.c_str())        \
+                  : -1;                                                        \
+          const int baseStart =                                                \
+              fitLength > 0 && fitLength <= (int)currentBaseRun.size()         \
+                  ? (int)currentBaseRun.size() - fitLength                     \
+                  : (currentBaseRun.size() > (size_t)rubyCount                 \
+                         ? (int)currentBaseRun.size() - rubyCount              \
+                         : 0);                                                 \
+          if (RUBY_DEBUG) {                                                    \
+            static std::map<std::wstring, int> loggedRuby;                     \
+            if (loggedRuby.find(rubyText) == loggedRuby.end() &&               \
+                loggedRuby.size() < 256) {                                     \
+              loggedRuby[rubyText] = fitLength;                                \
+              std::stringstream dbg;                                           \
+              dbg << "rubyDialogue: y=" << currentY                            \
+                  << " rubyGlyphs=" << rubyCount                               \
+                  << " baseRun=" << currentBaseRun.size()                      \
+                  << " fit=" << fitLength << " baseStart=" << baseStart;       \
+              LanguageBarrierLog(dbg.str());                                   \
+            }                                                                  \
+          }                                                                    \
+          rubyRunPositions.clear();                                            \
+          rubyRunPositions.reserve(rubyCount);                                 \
+          if ((int)currentBaseRun.size() - baseStart == rubyCount) {           \
+            for (int j = 0; j < rubyCount; j++) {                              \
+              uint32_t rubyChar = page->glyphCol[i + j] +                     \
+                                  page->glyphRow[i + j] *                     \
+                                      TextRendering::Get().GLYPHS_PER_ROW;     \
+              auto rubyGlyph = TextRendering::Get()                            \
+                                   .getFont(page->glyphDisplayHeight[i + j] *  \
+                                                1.5f,                          \
+                                            false)                             \
+                                   ->getGlyphInfo(rubyChar, Regular);          \
+              auto& baseGlyph = currentBaseRun[baseStart + j];                \
+              rubyRunPositions.push_back(                                      \
+                  baseGlyph.x + (baseGlyph.advance - rubyGlyph->advance) /     \
+                                    2.0f);                                     \
+            }                                                                  \
+          } else {                                                             \
+            float baseStartX = currentBaseRun[baseStart].x;                    \
+            float baseEndX = currentBaseRun.back().x +                         \
+                             currentBaseRun.back().advance;                    \
+            float rubyWidth = 0.0f;                                            \
+            for (int j = 0; j < rubyCount; j++) {                              \
+              uint32_t rubyChar = page->glyphCol[i + j] +                     \
+                                  page->glyphRow[i + j] *                     \
+                                      TextRendering::Get().GLYPHS_PER_ROW;     \
+              auto rubyGlyph = TextRendering::Get()                            \
+                                   .getFont(page->glyphDisplayHeight[i + j] *  \
+                                                1.5f,                          \
+                                            false)                             \
+                                   ->getGlyphInfo(rubyChar, Regular);          \
+              rubyWidth += rubyGlyph->advance;                                 \
+            }                                                                  \
+            float rubyX = baseStartX + (baseEndX - baseStartX - rubyWidth) /    \
+                                       2.0f;                                   \
+            for (int j = 0; j < rubyCount; j++) {                              \
+              uint32_t rubyChar = page->glyphCol[i + j] +                     \
+                                  page->glyphRow[i + j] *                     \
+                                      TextRendering::Get().GLYPHS_PER_ROW;     \
+              auto rubyGlyph = TextRendering::Get()                            \
+                                   .getFont(page->glyphDisplayHeight[i + j] *  \
+                                                1.5f,                          \
+                                            false)                             \
+                                   ->getGlyphInfo(rubyChar, Regular);          \
+              rubyRunPositions.push_back(rubyX);                               \
+              rubyX += rubyGlyph->advance;                                     \
+            }                                                                  \
+          }                                                                    \
+          rubyRunY = currentY;                                                  \
+          rubyRunEnd = rubyEnd - 1;                                            \
+          rubyRunPositionIndex = 0;                                            \
+          isRubyRun = true;                                                    \
+        }                                                                      \
+        auto nextX = nextXByLine.find(currentY);                               \
+        if (isRubyRun &&                                                       \
+            rubyRunPositionIndex < (int)rubyRunPositions.size()) {             \
+          displayStartX = rubyRunPositions[rubyRunPositionIndex++];            \
+        } else if (nextX != nextXByLine.end()) {                               \
+          displayStartX = nextX->second;                                       \
         } else {                                                               \
           displayStartX =                                                      \
               (page->charDisplayX[i] + xOffset) * COORDS_MULTIPLIER;           \
@@ -1448,6 +1529,20 @@ int __cdecl dialogueLayoutRelatedHook(int unk0, int* unk1, int* unk2, int unk3,
                 round(displayStartX + glyphInfo->left),                        \
                 round(yOffset + displayStartY + fontSize - glyphInfo->top),    \
                 page->charColor[i], _opacity, 4);                              \
+          nextXByLine[currentY] = displayStartX + glyphInfo->advance;          \
+          if (!isRubyRun) {                                                    \
+            if (!hasBaseY || currentY != lastBaseY) {                          \
+              currentBaseRun.clear();                                          \
+              lastBaseY = currentY;                                            \
+              hasBaseY = true;                                                 \
+            }                                                                  \
+            DialogueRubyBaseGlyph baseGlyph;                                   \
+            baseGlyph.x = displayStartX;                                       \
+            baseGlyph.advance = (float)glyphInfo->advance;                     \
+            baseGlyph.ch =                                                     \
+                TextRendering::Get().getCharForGlyphId((int)currentChar);      \
+            currentBaseRun.push_back(baseGlyph);                               \
+          }                                                                    \
           page->field_20 = (displayStartX + glyphInfo->advance) / 1.5f;        \
         }                                                                      \
       }                                                                        \
@@ -1458,43 +1553,6 @@ DEF_DRAW_DIALOGUE_HOOK(drawDialogueHook, DialoguePage_t);
 DEF_DRAW_DIALOGUE_HOOK(ccDrawDialogueHook, CCDialoguePage_t);
 DEF_RNDRAW_DIALOGUE_HOOK(rnDrawDialogueHook, RNEDialoguePage_t);
 DEF_RNDRAW_DIALOGUE_HOOK(rnDDrawDialogueHook, RNDDialoguePage_t);
-void __cdecl sgmdeDrawDialogueHook(int fontNumber, int pageNumber,
-                                   uint32_t opacity, int xOffset, int yOffset) {
-  SGMDEDialoguePage_t* page =
-      &gameExeDialoguePages_SGMDEDialoguePage_t[pageNumber];
-  for (int i = 0; i < page->pageLength; i++) {
-    if (fontNumber == page->fontNumber[i]) {
-      int displayStartX = (page->charDisplayX[i] + xOffset) * COORDS_MULTIPLIER;
-      int displayStartY = (page->charDisplayY[i] + yOffset) * COORDS_MULTIPLIER;
-      uint32_t _opacity = (page->charDisplayOpacity[i] * opacity) >> 8;
-      if (page->charOutlineColor[i] != -1) {
-        gameExeDrawGlyph(
-            OUTLINE_TEXTURE_ID,
-            OUTLINE_CELL_WIDTH * page->glyphCol[i] * COORDS_MULTIPLIER,
-            OUTLINE_CELL_HEIGHT * page->glyphRow[i] * COORDS_MULTIPLIER,
-            page->glyphOrigWidth[i] * COORDS_MULTIPLIER + (2 * OUTLINE_PADDING),
-            page->glyphOrigHeight[i] * COORDS_MULTIPLIER +
-                (2 * OUTLINE_PADDING),
-            displayStartX - OUTLINE_PADDING, displayStartY - OUTLINE_PADDING,
-            displayStartX + (COORDS_MULTIPLIER * page->glyphDisplayWidth[i]) +
-                OUTLINE_PADDING,
-            displayStartY + (COORDS_MULTIPLIER * page->glyphDisplayHeight[i]) +
-                OUTLINE_PADDING,
-            page->charOutlineColor[i], _opacity);
-      }
-      gameExeDrawGlyph(
-          FIRST_FONT_ID,
-          FONT_CELL_WIDTH * page->glyphCol[i] * COORDS_MULTIPLIER,
-          FONT_CELL_HEIGHT * page->glyphRow[i] * COORDS_MULTIPLIER,
-          page->glyphOrigWidth[i] * COORDS_MULTIPLIER,
-          page->glyphOrigHeight[i] * COORDS_MULTIPLIER, displayStartX,
-          displayStartY,
-          displayStartX + (COORDS_MULTIPLIER * page->glyphDisplayWidth[i]),
-          displayStartY + (COORDS_MULTIPLIER * page->glyphDisplayHeight[i]),
-          page->charColor[i], _opacity);
-    }
-  }
-};
 
 void __cdecl drawDialogue2Hook(int fontNumber, int pageNumber,
                                uint32_t opacity) {
@@ -1514,10 +1572,44 @@ void __cdecl rnDDrawDialogue2Hook(int fontNumber, int pageNumber,
   rnDDrawDialogueHook(fontNumber, pageNumber, opacity, 0, 0);
 }
 
-void __cdecl sgmdeDrawDialogue2Hook(int fontNumber, int pageNumber,
-                                    uint32_t opacity) {
-  sgmdeDrawDialogueHook(fontNumber, pageNumber, opacity, 0, 0);
+// Line-break rules for the CJK half of the charset. These mirror the two
+// punctuation sets in patchdef.json (base.type1Punctuation = breaks allowed
+// *after* these, base.type2Punctuation = allowed *before* these), which the
+// dialogue wordwrap uses for the same purpose; kept as literals here because
+// those are stored as charset indices, not characters.
+//
+// Only the fullwidth/CJK forms are listed. Latin punctuation is left out on
+// purpose: it only ever sits inside a Latin run, and Latin runs already stay
+// unbroken.
+static bool isNoLineStartChar(wchar_t c) {
+  static const std::wstring set =
+      L"。，、．：；？！）〕］｝〉》」』】”’…‥ー々ぁぃぅぇぉっゃゅょ"
+      L"ァィゥェォッャュョ・ヽヾゝゞ～－／％＞＜＝＋";
+  return set.find(c) != std::wstring::npos;
 }
+
+static bool isNoLineEndChar(wchar_t c) {
+  static const std::wstring set = L"（〔［｛〈《「『【“‘＜";
+  return set.find(c) != std::wstring::npos;
+}
+
+// Wide (East Asian W/F) characters, by the ranges the game's charsets use.
+static bool isWideGlyphChar(wchar_t c) {
+  return (c >= 0x1100 && c <= 0x115F) || (c >= 0x2E80 && c <= 0xA4CF) ||
+         (c >= 0xAC00 && c <= 0xD7A3) || (c >= 0xF900 && c <= 0xFAFF) ||
+         (c >= 0xFE30 && c <= 0xFE6F) || (c >= 0xFF00 && c <= 0xFF60) ||
+         (c >= 0xFFE0 && c <= 0xFFE6);
+}
+
+// A break is allowed between prev and cur when neither side is punctuation that
+// would be stranded (kinsoku), and at least one side is wide -- i.e. anywhere
+// inside CJK text, or at a CJK/Latin boundary. A narrow/narrow pair is inside a
+// Latin word and must never be broken.
+static bool isCjkBreakOpportunity(wchar_t prev, wchar_t cur) {
+  if (prev == 0 || isNoLineStartChar(cur) || isNoLineEndChar(prev)) return false;
+  return isWideGlyphChar(prev) || isWideGlyphChar(cur);
+}
+
 void semiTokeniseSc3String(char* sc3string, std::list<StringWord_t>& words,
                            int baseGlyphSize, int lineLength) {
   if (HAS_SGHD_PHONE) {
@@ -1528,12 +1620,33 @@ void semiTokeniseSc3String(char* sc3string, std::list<StringWord_t>& words,
   int sc3evalResult;
   StringWord_t word = {sc3string, NULL, 0, false, false};
   const auto& fontData = TextRendering::Get().enabled
-                             ? TextRendering::Get().getFont(baseGlyphSize, true)
-                             : nullptr;
+                              ? TextRendering::Get().getFont(baseGlyphSize, true)
+                              : nullptr;
+  bool insideRubyText = false;
+  // Previous glyph actually seen, so a break opportunity can be judged across
+  // token boundaries. Reset at hard breaks and ruby markers.
+  wchar_t prevGlyph = 0;
+  // Glyphs of the word currently being built, so a break that would strand
+  // punctuation at the start of the next line can be moved back over the
+  // punctuation run to keep it company.
+  struct WordGlyph {
+    char* start;
+    uint16_t width;
+    wchar_t ch;
+  };
+  std::vector<WordGlyph> wordGlyphs;
 
   char c;
   while (sc3string != NULL) {
     c = *sc3string;
+    if ((uint8_t)c == 0x80 && sc3string[1] >= 9 && sc3string[1] <= 11 &&
+        (RUBY_MARKERS_ENABLED && (sc3string[1] == 10 || insideRubyText))) {
+      if (sc3string[1] == 10) insideRubyText = true;
+      if (sc3string[1] == 11) insideRubyText = false;
+      sc3string += 2;
+      continue;
+    }
+
     switch (c) {
       case -1:
         word.end = sc3string - 1;
@@ -1544,6 +1657,8 @@ void semiTokeniseSc3String(char* sc3string, std::list<StringWord_t>& words,
         word.endsWithLinebreak = true;
         words.push_back(word);
         word = {++sc3string, NULL, 0, false, false};
+        prevGlyph = 0;
+        wordGlyphs.clear();
         break;
       case 4:
         sc3.pc = sc3string + 1;
@@ -1554,9 +1669,17 @@ void semiTokeniseSc3String(char* sc3string, std::list<StringWord_t>& words,
       case 0xB:
       case 0x1E:
         sc3string++;
+        prevGlyph = 0;
+        wordGlyphs.clear();
         break;
       default:
         int glyphId = (uint8_t)sc3string[1] + ((c & 0x7f) << 8);
+        if (insideRubyText) {
+          sc3string += 2;
+          prevGlyph = 0;
+          wordGlyphs.clear();
+          break;
+        }
         uint16_t glyphWidth = 0;
         if (!TextRendering::Get().enabled) {
           glyphWidth = (baseGlyphSize * widths[glyphId]) / FONT_CELL_WIDTH;
@@ -1565,19 +1688,58 @@ void semiTokeniseSc3String(char* sc3string, std::list<StringWord_t>& words,
                            .glyphMap[TextRendering::Get().fullCharMap[glyphId]]
                            .advance;
         }
+        const std::wstring& charMap = TextRendering::Get().fullCharMap;
+        const wchar_t curChar =
+            glyphId < (int)charMap.length() ? charMap[glyphId] : 0;
         if (glyphId == GLYPH_ID_FULLWIDTH_SPACE ||
             glyphId == GLYPH_ID_HALFWIDTH_SPACE) {
           word.end = sc3string - 1;
           words.push_back(word);
           word = {sc3string, NULL, glyphWidth, true, false};
+          wordGlyphs.clear();
         } else {
-          if (word.cost + glyphWidth > lineLength) {
+          // A CJK break opportunity starts a new word, so the renderer can then
+          // fill each line to the edge and wrap a CJK run per character instead
+          // of treating the whole run as one indivisible block. When
+          // startsWithSpace is set, word.start sits on the leading space itself,
+          // so require content past it -- otherwise the space would become a
+          // word of its own and wrap onto its own line.
+          bool wordHasContent =
+              sc3string > word.start + (word.startsWithSpace ? 2 : 0);
+          bool doBreak =
+              word.cost + glyphWidth > lineLength ||
+              (CJK_LINE_BREAK && wordHasContent &&
+               isCjkBreakOpportunity(prevGlyph, curChar));
+          // Breaking here would start the next line with punctuation. Move the
+          // break back so the punctuation keeps a companion character (kinsoku
+          // shori); if there is nothing to move, leave the break alone.
+          if (doBreak && CJK_LINE_BREAK && isNoLineStartChar(curChar) &&
+              !wordGlyphs.empty()) {
+            int k = (int)wordGlyphs.size() - 1;
+            while (k >= 0 && isNoLineStartChar(wordGlyphs[k].ch)) k--;
+            if (k >= 0) {
+              uint16_t moved = 0;
+              for (int t = k; t < (int)wordGlyphs.size(); t++)
+                moved += wordGlyphs[t].width;
+              char* newStart = wordGlyphs[k].start;
+              word.end = newStart - 1;
+              word.cost -= moved;
+              words.push_back(word);
+              word = {newStart, NULL, moved, false, false};
+              wordGlyphs.erase(wordGlyphs.begin() + k, wordGlyphs.end());
+              doBreak = false;
+            }
+          }
+          if (doBreak) {
             word.end = sc3string - 1;
             words.push_back(word);
             word = {sc3string, NULL, 0, false, false};
+            wordGlyphs.clear();
           }
           word.cost += glyphWidth;
+          wordGlyphs.push_back({sc3string, glyphWidth, curChar});
         }
+        prevGlyph = curChar;
         sc3string += 2;
         break;
     }
@@ -1894,6 +2056,18 @@ struct BacklogSize {
   uint8_t d;
 };
 
+struct BacklogRubyBaseGlyph {
+  float x;
+  float advance;
+};
+
+struct BacklogRubyTextGlyph {
+  int index;
+  uint16_t glyph;
+  int color;
+  float advance;
+};
+
 void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
                                        int startX, int startY,
                                        unsigned int maskY, int maskHeight,
@@ -1941,6 +2115,50 @@ void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
   int v33;           // [esp+6Ch] [ebp-4h]
   int maxXX = 0;
   startX += 80;
+
+  // Speaker-name column.
+  //
+  // The body text needs no help: the game already lays every row's body out on
+  // one fixed column, narration and quoted lines alike (measured: the body
+  // anchor comes out identical on every row, named or not). What was ragged
+  // was the *names* -- the game centres the "speaker icon + name" block, so a
+  // one-character name and a two-character name end at different x.
+  //
+  // So the fix touches names only. Each name is right-aligned to just before
+  // the body column, which means a long name grows to the left into the space
+  // between the icon and the text rather than pushing the text to the right.
+  // The body keeps the coordinate the game gave it, so the hover highlight --
+  // which is drawn from those same body coordinates -- stays put.
+  int bodyCol = 0;
+  bool haveColumn = false;
+  if (BACKLOG_NAME_ALIGN) {
+    const int lineCount = *BacklogLineBufUse;
+    for (int li = 0; li < lineCount; li++) {
+      const int bufPos = BacklogLineBufSize[BacklogDispLinePos[li]];
+      const int bufEnd = BacklogLineBufEndp[BacklogDispLinePos[li]];
+      if (!bufEnd) continue;
+      long long nEnd = -1;
+      for (int k = bufPos; k < bufPos + bufEnd; k++) {
+        if (BacklogText[k] == 0x8002) { nEnd = k; break; }
+      }
+      if (nEnd < 0) continue;
+      // First drawable glyph after the name is where this row's body begins;
+      // its stored x is the shared body column.
+      for (int k = nEnd + 1; k < bufPos + bufEnd; k++) {
+        if (BacklogText[k] < 0x8000) {
+          bodyCol = BacklogTextPos[2 * k];
+          haveColumn = true;
+          break;
+        }
+      }
+      if (haveColumn) break;
+    }
+  }
+  // Where a right-aligned name's right edge sits: one gap left of the body.
+  // The body itself is never moved -- it keeps the coordinate the game gave it,
+  // which is also what the hover highlight is drawn from.
+  const int nameColRight = bodyCol - BACKLOG_BODY_GAP;
+
   if (*BacklogLineBufUse) {
     v8 = 0;
     v23 = 0;
@@ -1955,47 +2173,216 @@ void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
         v32 = 0;
         v22 = v11;
         v24 = 0;
+        // Diagnostics for the backlog name/body columns (BACKLOG_NAME_DEBUG).
+        // Declared at row scope -- the write-back further down reports them, and
+        // that sits outside the per-row drawing block.
+        int dbgRewrite = 0;
+        int dbgRowStrIndex = -1;
+        long long dbgNameStart = -1, dbgNameEnd = -1;
+        int dbgNameLen = 0;
+        short dbgRowArrBefore = 0, dbgNameArrBefore = 0, dbgNameArrAfter = 0;
+        float dbgFirstX = -1.0f;
+        bool dbgCapturedX = false;
+        int dbgHaveName = 0;
+        int dbgColRight = 0;
+        // Horizontal shift applied to this row's speaker name, in draw units.
+        // The name is moved by writing BacklogTextPos[], but the per-glyph
+        // advance below *accumulates* rather than re-reading that array, so
+        // without carrying the shift forward the body after the name -- and any
+        // ruby base run on it -- would still be laid out from where the name
+        // used to sit.
+        float nameShiftDraw = 0.0f;
+        // Right edge of this row's (shifted) name, in draw units; the body
+        // resumes from here plus the configured gap.
+        float nameRightEdgeDraw = 0.0f;
+        bool inNameRun = false;
+        bool nameRunDone = false;
         if (v11 + BacklogDispLineSize[v8] > v9 && v11 < v9 + maskHeight) {
           v12 = BacklogDispLinePos[v8];
           v13 = 0;
           v27 = 0;
           strIndex = BacklogLineBufSize[v12];
           v26 = BacklogLineBufEndp[v12];
+          if (BACKLOG_NAME_DEBUG) dbgRowStrIndex = strIndex;
           if (v26) {
-            auto ws = std::wstring_view((wchar_t*)BacklogText);
-            auto nameStart = ws.find(0x8001, strIndex);
-            auto nameEnd = ws.find(0x8002, strIndex);
-            auto c = nameEnd - nameStart;
-            short lastNameX = BacklogTextPos[2 * nameEnd - 2];
-            short maxX = -40;
-            short diff = lastNameX - maxX;
+            // Search this row's own extent, not a NUL-terminated view.
+            //
+            // This used to be std::wstring_view((wchar_t*)BacklogText), which
+            // measures with wcslen. BacklogText is a ring buffer of uint16_t
+            // glyph ids and glyph 0 is a real character (a space), so the view
+            // ended at the first space glyph -- 404 units in, measured. Rows
+            // live far past that (strIndex up to ~2000), so find() started
+            // outside the view and always returned npos: the upstream
+            // right-align block below never ran once, silently. The draw loop
+            // further down walks strIndex..strIndex+v26 instead, which is why
+            // rows still rendered correctly while the alignment never applied.
+            long long nameStart = -1, nameEnd = -1;
+            for (int k = strIndex; k < strIndex + v26; k++) {
+              if (BacklogText[k] == 0x8001) {
+                for (int j = k + 1; j < strIndex + v26; j++) {
+                  if (BacklogText[j] == 0x8002) {
+                    nameStart = k;
+                    nameEnd = j;
+                    break;
+                  }
+                }
+                if (nameStart >= 0) break;
+              }
+            }
+            // lastNameX is only read when a name was actually found; the old
+            // code indexed with nameEnd unconditionally, which under the npos
+            // case above was a wild read.
+            short lastNameX =
+                nameEnd >= 0 ? BacklogTextPos[2 * nameEnd - 2] : 0;
             auto glyphSize = BacklogTextSize[4 * (strIndex + 1) + 3] * 1.5f;
             int length = 0;
 
-            if (diff != 0 && nameStart < nameEnd &&
-                nameStart < strIndex + v26 && (nameEnd - nameStart) < v26) {
+            // Diagnostics (BACKLOG_NAME_DEBUG): record what the marker search
+            // found and what the array held, then report at row end whether the
+            // rewrite below took and which x the first glyph actually got.
+            // One line per row, deduped -- this runs every frame.
+            const bool logRow = BACKLOG_NAME_DEBUG;
+            if (logRow) {
+              const bool nsOk = nameStart >= 0;
+              const bool neOk = nameEnd >= 0;
+              if (nsOk) dbgNameStart = nameStart;
+              if (neOk) dbgNameEnd = nameEnd;
+              dbgRowArrBefore = BacklogTextPos[2 * strIndex];
+              if (nsOk && neOk && nameEnd > nameStart)
+                dbgNameArrBefore = BacklogTextPos[2 * (nameStart + 1)];
+            }
+
+            // Right-align the name to the shared column.
+            //
+            // Absolute writes only: BacklogTextPos[] persists across frames, so
+            // adding a delta each frame would accumulate and walk the name off
+            // screen. `length` is already in draw units (the advances come from
+            // a font fetched at glyphSize, which carries COORDS_MULTIPLIER), and
+            // BacklogTextPos[] is read in those same units -- so no scaling here.
+            const bool haveName = nameStart >= 0 && nameEnd > nameStart &&
+                                  nameEnd - nameStart < v26;
+            if (logRow) dbgHaveName = haveName ? 1 : 0;
+            if (haveName) {
               for (int i = nameStart + 1; i < nameEnd; i++) {
                 length += TextRendering::Get()
                               .getFont(glyphSize, false)
                               ->getGlyphInfo(BacklogText[i], Regular)
                               ->advance;
               }
-              int initialX = maxX - length;
-
-              for (int i = nameStart + 1; i < nameEnd; i++) {
-                BacklogTextPos[2 * i] = initialX;
-                initialX += TextRendering::Get()
-                                .getFont(glyphSize, false)
-                                ->getGlyphInfo(BacklogText[i], Regular)
-                                ->advance;
+              if (BACKLOG_NAME_ALIGN && haveColumn) {
+                const short wasAt = BacklogTextPos[2 * (nameStart + 1)];
+                int initialX = nameColRight - length;
+                for (int i = nameStart + 1; i < nameEnd; i++) {
+                  BacklogTextPos[2 * i] = (short)initialX;
+                  initialX += TextRendering::Get()
+                                  .getFont(glyphSize, false)
+                                  ->getGlyphInfo(BacklogText[i], Regular)
+                                  ->advance;
+                }
+                // How far this row's name moved. The draw loop advances glyphs
+                // by accumulating widths rather than re-reading the array, so
+                // the body (and any ruby on it) has to be carried by the same
+                // amount or it ends up back at the pre-move position.
+                nameShiftDraw = (float)(BacklogTextPos[2 * (nameStart + 1)] -
+                                        wasAt);
+                nameRightEdgeDraw = (float)nameColRight;
+                if (logRow) {
+                  dbgRewrite = 1;
+                  dbgNameArrAfter = BacklogTextPos[2 * (nameStart + 1)];
+                }
               }
             }
+            if (logRow) dbgNameLen = length;
             maxXX = 0;
             v32 = 0;
             v25 = 10000;
+            bool insideRubyBase = false;
+            bool insideRubyText = false;
+            bool haveComputedX = false;
+            int lastDrawableY = 0x7FFFFFFF;
+            float nextXPosition = 0.0f;
+            std::vector<BacklogRubyBaseGlyph> rubyBaseGlyphs;
+            std::vector<BacklogRubyTextGlyph> rubyTextGlyphs;
+            auto drawRubyText = [&]() {
+              if (rubyBaseGlyphs.empty() || rubyTextGlyphs.empty()) return;
+
+              std::vector<float> rubyXPositions;
+              rubyXPositions.reserve(rubyTextGlyphs.size());
+
+              if (rubyBaseGlyphs.size() == rubyTextGlyphs.size()) {
+                for (size_t i = 0; i < rubyTextGlyphs.size(); i++) {
+                  rubyXPositions.push_back(
+                      rubyBaseGlyphs[i].x +
+                      (rubyBaseGlyphs[i].advance - rubyTextGlyphs[i].advance) /
+                          2.0f);
+                }
+              } else {
+                float baseStart = rubyBaseGlyphs.front().x;
+                float baseEnd = rubyBaseGlyphs.back().x +
+                                rubyBaseGlyphs.back().advance;
+                float rubyWidth = 0.0f;
+                for (auto& glyph : rubyTextGlyphs) rubyWidth += glyph.advance;
+
+                float rubyX = baseStart + (baseEnd - baseStart - rubyWidth) /
+                                             2.0f;
+                for (auto& glyph : rubyTextGlyphs) {
+                  rubyXPositions.push_back(rubyX);
+                  rubyX += glyph.advance;
+                }
+              }
+
+              for (size_t i = 0; i < rubyTextGlyphs.size(); i++) {
+                auto& ruby = rubyTextGlyphs[i];
+                auto rubyGlyphSize = BacklogTextSize[4 * ruby.index + 3] * 1.5f;
+                TextRendering::Get().replaceFontSurface(rubyGlyphSize);
+                auto glyphInfo = TextRendering::Get()
+                                     .getFont(rubyGlyphSize, false)
+                                     ->getGlyphInfo(ruby.glyph, Regular);
+                int dummy1, dummy2;
+                int v35 = startY + BacklogDispLinePosY[v8] - *BacklogDispPos;
+                v35 *= 1.5f;
+                v35 += 24 * rubyGlyphSize / 48.0;
+
+                if (glyphInfo->width && glyphInfo->rows) {
+                  gameExeSg0DrawGlyph2(
+                      TextRendering::Get().FONT_TEXTURE_ID, maskTextureId,
+                      glyphInfo->x, glyphInfo->y, glyphInfo->width,
+                      glyphInfo->rows, 32 * 2,
+                      round(BacklogTextPos[2 * ruby.index + 1] * 1.5f + v35 +
+                            rubyGlyphSize / 2.0f - glyphInfo->top) -
+                          13,
+                      round(rubyXPositions[i] + glyphInfo->left),
+                      round(BacklogTextPos[2 * ruby.index + 1] * 1.5f + v35 +
+                            rubyGlyphSize / 2.0f - glyphInfo->top),
+                      round(rubyXPositions[i] + glyphInfo->left +
+                            glyphInfo->width),
+                      round(BacklogTextPos[2 * ruby.index + 1] * 1.5f +
+                            glyphInfo->rows + rubyGlyphSize / 2.0f -
+                            glyphInfo->top + v35),
+                      ruby.color, opacity, &dummy1, &dummy2);
+                }
+              }
+            };
             do {
               v15 = BacklogText[strIndex];
-              if ((v15 & 0x8000u) == 0) {
+              if ((v15 & 0x8000u) == 0 && insideRubyText) {
+                int rubyColorIndex = BacklogTextCo[strIndex];
+                int rubyMainColor = MesFontColor[2 * rubyColorIndex];
+                int rubyAltColor = MesFontColor[2 * rubyColorIndex + 1];
+                int rubyColor = rubyMainColor == 0xFFFFFF ? rubyAltColor
+                                                          : rubyMainColor;
+                auto rubyGlyphSize = BacklogTextSize[4 * strIndex + 3] * 1.5f;
+                auto rubyGlyphInfo = TextRendering::Get()
+                                         .getFont(rubyGlyphSize, false)
+                                         ->getGlyphInfo(BacklogText[strIndex],
+                                                        Regular);
+                BacklogRubyTextGlyph rubyGlyph;
+                rubyGlyph.index = strIndex;
+                rubyGlyph.glyph = (uint16_t)BacklogText[strIndex];
+                rubyGlyph.color = rubyColor;
+                rubyGlyph.advance = (float)rubyGlyphInfo->advance;
+                rubyTextGlyphs.push_back(rubyGlyph);
+              } else if ((v15 & 0x8000u) == 0) {
                 v18 = BacklogTextCo[strIndex];
                 v19 = MesFontColor[2 * v18];
                 color = MesFontColor[2 * v18 + 1];
@@ -2015,23 +2402,56 @@ void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
                     (BacklogSize*)&BacklogTextSize[4 * strIndex];
                 auto glyphSize = BacklogTextSize[4 * strIndex + 3] * 1.5f;
 
-                if (strIndex == 0 ||
-                    strIndex > 0 &&
-                        BacklogTextPos[2 * (strIndex) + 1] !=
-                            BacklogTextPos[2 * (strIndex - 1) + 1]) {
+                if (lastDrawableY == 0x7FFFFFFF ||
+                    BacklogTextPos[2 * strIndex + 1] != lastDrawableY) {
                   newline = true;
                 }
 
-                if (newline == false &&
-                    (BacklogText[strIndex - 1] & 0x8000) == 0) {
-                  auto glyphInfo =
-                      TextRendering::Get()
-                          .getFont(glyphSize, false)
-                          ->getGlyphInfo(BacklogText[strIndex - 1], Regular);
-                  xPosition += glyphInfo->advance;
+                // Is this glyph part of the speaker name?
+                const bool thisIsName =
+                    haveColumn && nameStart >= 0 &&
+                    strIndex > nameStart && strIndex < nameEnd;
+                if (thisIsName) inNameRun = true;
+
+                if (newline == false && haveComputedX) {
+                  xPosition = nextXPosition;
                 } else {
                   xPosition = (startX * 1.5f + BacklogTextPos[2 * strIndex]);
                   newline = false;
+                }
+
+                if (!haveColumn) {
+                  // Alignment off: leave the game's own layout alone.
+                } else if (thisIsName) {
+                  // The name was written to the shared column; the array is
+                  // read only at a row start, so add the shift here.
+                  xPosition += nameShiftDraw;
+                } else if (newline) {
+                  // Start of a visual line with no speaker name of its own:
+                  // narration, and the wrapped continuation of a quoted line.
+                  // Put it on the shared body column. (The game already lays
+                  // these out there, so this is normally a no-op; it keeps the
+                  // invariant explicit and covers a row whose stored value is
+                  // stale.)
+                  //
+                  // Keyed on `newline`, not "first glyph seen": a quoted line
+                  // wraps into several visual lines inside one buffer entry, and
+                  // each of them needs the column, not just the first.
+                  xPosition = startX * 1.5f + (float)bodyCol;
+                  nameRunDone = true;
+                } else if (inNameRun && !nameRunDone) {
+                  // Name ended without a wrap: resume the body on the shared
+                  // body column, so the gap after the name is the same on every
+                  // row.
+                  nameRunDone = true;
+                  xPosition = startX * 1.5f + (float)bodyCol;
+                }
+                // First glyph of this row: its x is what the reader sees as the
+                // row's left edge. Captured for the diagnostics below.
+                if (logRow && !dbgCapturedX &&
+                    strIndex == (int)BacklogLineBufSize[v12]) {
+                  dbgFirstX = xPosition;
+                  dbgCapturedX = true;
                 }
 
                 TextRendering::Get().replaceFontSurface(glyphSize);
@@ -2039,6 +2459,15 @@ void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
                     TextRendering::Get()
                         .getFont(glyphSize, false)
                         ->getGlyphInfo(BacklogText[strIndex], Regular);
+                nextXPosition = xPosition + glyphInfo->advance;
+                haveComputedX = true;
+                lastDrawableY = BacklogTextPos[2 * strIndex + 1];
+                if (insideRubyBase) {
+                  BacklogRubyBaseGlyph baseGlyph;
+                  baseGlyph.x = xPosition;
+                  baseGlyph.advance = (float)glyphInfo->advance;
+                  rubyBaseGlyphs.push_back(baseGlyph);
+                }
                 int dummy1, dummy2;
                 int v35 = startY + BacklogDispLinePosY[v8] - *BacklogDispPos;
                 v35 *= 1.5f;
@@ -2095,15 +2524,32 @@ void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
                 }
                 if (v27 == 1 && v10 == 0xFFFF) v10 = v33;
               } else {
-                v16 = v15 & 0x7FFF;
-                if (v16 == 1) {
-                  v13 = 1;
-                  v24 = 1;
+                if ((v15 & 0x8000u) != 0) {
+                  v16 = v15 & 0x7FFF;
+                  if (v16 == 9) {
+                    insideRubyBase = true;
+                    insideRubyText = false;
+                    rubyBaseGlyphs.clear();
+                    rubyTextGlyphs.clear();
+                  } else if (v16 == 10) {
+                    insideRubyText = true;
+                  } else if (v16 == 11) {
+                    drawRubyText();
+                    insideRubyBase = false;
+                    insideRubyText = false;
+                    rubyBaseGlyphs.clear();
+                    rubyTextGlyphs.clear();
+                  } else {
+                    if (v16 == 1) {
+                      v13 = 1;
+                      v24 = 1;
+                    }
+                    v17 = 0;
+                    if (v16 != 2) v17 = v13;
+                    v13 = v17;
+                    v27 = v17;
+                  }
                 }
-                v17 = 0;
-                if (v16 != 2) v17 = v13;
-                v13 = v17;
-                v27 = v17;
               }
               v21 = strIndex + 1;
               strIndex = 0;
@@ -2121,6 +2567,33 @@ void __cdecl DrawBacklogContentHookRND(int textureId, int maskTextureId,
         BacklogDispCurPosEX[v8] = v32 - 8;
         BacklogDispCurPosEY[v8] = v24;
         dword_948628[v8++] = v10;
+        if (BACKLOG_NAME_DEBUG) dbgColRight = nameColRight;
+        if (BACKLOG_NAME_DEBUG) {
+          // One line per distinct row, deduped by (strIndex, line buffer):
+          // the hook runs every frame while the panel is open.
+          static std::map<long long, bool> loggedRows;
+          long long key = ((long long)dbgRowStrIndex << 32) ^ (long long)v8;
+          if (dbgRowStrIndex >= 0 &&
+              loggedRows.find(key) == loggedRows.end() &&
+              loggedRows.size() < 512) {
+            loggedRows[key] = true;
+            std::stringstream dbg;
+            dbg << "backlogName: row=" << v8
+                << " strIndex=" << dbgRowStrIndex
+                << " nameStart=" << dbgNameStart
+                << " nameEnd=" << dbgNameEnd
+                << " nameLen=" << dbgNameLen
+                << " haveName=" << dbgHaveName
+                << " colRight=" << dbgColRight
+                << " rewrite=" << dbgRewrite
+                << " arrRowBefore=" << dbgRowArrBefore
+                << " arrNameBefore=" << dbgNameArrBefore
+                << " arrNameAfter=" << dbgNameArrAfter
+                << " firstGlyphX=" << dbgFirstX
+                << " iconAnchor=" << v31 << " nameAnchor=" << v10;
+            LanguageBarrierLog(dbg.str());
+          }
+        }
         v23 = v8;
       } while (v8 < *BacklogLineBufUse);
     }
@@ -2242,6 +2715,20 @@ int __cdecl drawTwipoContentHook(int textureId, int startX, int startY,
                                   a12, a13, a14);
     ;
   }
+
+  auto twipoFixIter =
+      retAddrToTwipoContentFixes.find((uintptr_t)_ReturnAddress());
+  if (twipoFixIter != retAddrToTwipoContentFixes.end()) {
+    startX += twipoFixIter->second.dx;
+    if (TWIPO_CONTENT_DEBUG) {
+      std::stringstream dbg;
+      dbg << "twipoContentFix: ret=" << std::hex << (uintptr_t)_ReturnAddress()
+          << std::dec << " dx=" << twipoFixIter->second.dx
+          << " startX=" << startX;
+      LanguageBarrierLog(dbg.str());
+    }
+  }
+
   int xOffset, yOffset;
   xOffset = 0;
   yOffset = 0;
@@ -2423,9 +2910,7 @@ float addCharacter(ProcessedSc3String_t* result, int baseGlyphSize, int glyphId,
                    const MultiplierData* mData) {
   int i = result->length;
   const auto& fontData = TextRendering::Get().getFont(baseGlyphSize, false);
-  wchar_t character = TextRendering::Get().fullCharMap.size() == 0
-                          ? wchar_t(0)
-                          : TextRendering::Get().fullCharMap[glyphId];
+  char character = TextRendering::Get().fullCharMap[glyphId];
   result->text[i] = character;
   if (curLinkNumber != NOT_A_LINK) {
     result->linkCharCount++;
@@ -2517,6 +3002,7 @@ void processSc3TokenList(int xOffset, int yOffset, int lineLength,
   int prevLineLength = 0;
   int spaceCost = 0;
   int ellipsisCost = 0;
+  bool insideRubyText = false;
 
   if (TextRendering::Get().enabled) {
     spaceCost = TextRendering::Get()
@@ -2537,7 +3023,6 @@ void processSc3TokenList(int xOffset, int yOffset, int lineLength,
   } else {
     spaceCost =
         (widths[GLYPH_ID_FULLWIDTH_SPACE] * baseGlyphSize) / FONT_CELL_WIDTH;
-    ellipsisCost = 3 * (widths[GLYPH_ID_DOT] * baseGlyphSize) / FONT_CELL_WIDTH;
   }
 
   for (auto it = words.begin(); it != words.end(); it++) {
@@ -2581,6 +3066,14 @@ void processSc3TokenList(int xOffset, int yOffset, int lineLength,
                           : it->start;
     while (sc3string <= it->end) {
       c = *sc3string;
+      if ((uint8_t)c == 0x80 && sc3string[1] >= 9 && sc3string[1] <= 11 &&
+          (RUBY_MARKERS_ENABLED && (sc3string[1] == 10 || insideRubyText))) {
+        if (sc3string[1] == 10) insideRubyText = true;
+        if (sc3string[1] == 11) insideRubyText = false;
+        sc3string += 2;
+        continue;
+      }
+
       switch (c) {
         case -1:
           goto afterWord;
@@ -2610,6 +3103,10 @@ void processSc3TokenList(int xOffset, int yOffset, int lineLength,
           break;
         default:
           int glyphId = (uint8_t)sc3string[1] + ((c & 0x7f) << 8);
+          if (insideRubyText) {
+            sc3string += 2;
+            break;
+          }
           if (TextRendering::Get().enabled) {
             if (result->lines < lineCount - 1 ||
                 (result->lines == lineCount - 1 &&
@@ -2621,10 +3118,7 @@ void processSc3TokenList(int xOffset, int yOffset, int lineLength,
             }
           } else {
             int i = result->length;
-            wchar_t character = TextRendering::Get().fullCharMap.size() == 0
-                                    ? wchar_t(0)
-                                    : TextRendering::Get().fullCharMap[glyphId];
-            result->text[i] = character;
+
             if (result->lines >= lineCount) break;
             if (curLinkNumber != NOT_A_LINK) {
               result->linkCharCount++;
@@ -2637,7 +3131,6 @@ void processSc3TokenList(int xOffset, int yOffset, int lineLength,
               // get buffer overflows with long mails
               result->linkNumber[i] = curLinkNumber;
               result->glyph[i] = glyphId;
-
               result->textureStartX[i] =
                   FONT_CELL_WIDTH * multiplier * (glyphId % FONT_ROW_LENGTH);
               result->textureStartY[i] =
@@ -2690,9 +3183,6 @@ int __cdecl drawPhoneTextHook(int textureId, int xOffset, int yOffset,
 
   if (!lineLength) lineLength = DEFAULT_LINE_LENGTH;
 
-    if (currentGame == SGMDE && lineLength == 252) lineDisplayCount = 2;
-
-
   std::list<StringWord_t> words;
   semiTokeniseSc3String(sc3string, words, baseGlyphSize, lineLength);
   processSc3TokenList(xOffset, yOffset, lineLength, words, lineSkipCount, color,
@@ -2711,115 +3201,8 @@ int __cdecl drawPhoneTextHook(int textureId, int xOffset, int yOffset,
                      opacity);
   }
 
-      if (currentGame == SGMDE && lineLength == 252) str.lines --;
-
-
-  return min(lineDisplayCount, str.lines);
+  return str.lines;
 }
-
-
-
-  int __cdecl sgmdeDrawTextAsciiHook(int textureId,               // a1
-                                     int xOffset,                 // a2
-                                     int yOffset,                 // a3
-                                     char* asciiString,           // a4
-                                     int color,                   // a5
-                                     unsigned int lineLength,  // a6
-                                     unsigned int baseGlyphSize,    // a7
-                                     unsigned int maxChars)       // a8
-  {
-    char* currentChar = asciiString;
-    unsigned int opacity = (maxChars <= 0xFF) ? maxChars : 255;
-    unsigned int processedChars = 0;
-    int characterIndex = 0;
-    int glyphYOffset = 0;
-    char glyphChar = *currentChar;
-    auto * gameExeLookUpTable1 = gameExeLookUpTable+1;
-    std::vector<char> sc3String;
-    for (characterIndex = 0; *currentChar;) {
-      if (processedChars >= lineLength) break;
-
-      char lookupChar = gameExeLookUpTable[0];  // First lookup table char
-      unsigned int lookupIndex = 0;
-      unsigned int extraYOffset = 0;
-
-      if (!lookupChar) goto NoMatch;
-
-      // Search the character in lookup table
-      do {
-        if (lookupChar == glyphChar) break;
-        lookupChar = gameExeLookUpTable1[lookupIndex++];
-      } while (lookupChar);
-
-      if (!lookupIndex) {
-      NoMatch:
-        lookupIndex = 66;  // fallback to index 66
-        extraYOffset = (15 * baseGlyphSize) >> 5;
-      }
-
-      unsigned int clampedIndex = (lookupIndex <= 0x54) ? lookupIndex : 0;
-
-
-
-      unsigned __int8 glyphWidth = (textureId == 79)
-                                       ? gameExeGlyphWidthsFont1[clampedIndex]
-                                       : gameExeGlyphWidthsFont2[clampedIndex];
-      float glyphWidthScaled = (float)glyphWidth * 1.5f;
-
-      float scaledStartX = (float)xOffset * 1.5f;
-      float scaledStartY = (float)yOffset * 1.5f;
-      float scaledEndX = (float)(((16 * baseGlyphSize) >> 5) + xOffset) * 1.5f;
-      float scaledEndY = (float)(baseGlyphSize + extraYOffset + yOffset) * 1.5f;
-
-      //gameExeDrawGlyph(textureId, (float)glyphXInTexture * 1.5f,
-      //          (float)(glyphYOffset + 1) * 1.5f, glyphWidthScaled, 45.0f,
-      //          scaledStartX, scaledStartY, scaledEndX, scaledEndY, color,
-      //          opacity);
-
-      processedChars = characterIndex + 1;
-      currentChar++;
-      glyphChar = *currentChar;
-      ++characterIndex;
-      sc3String.push_back(0x80);
-      sc3String.push_back(clampedIndex);
-
-    }
-
-      ProcessedSc3String_t str;
-
-      int lineDisplayCount = 1;
-      int lineSkipCount = 0;
-
-    if (!lineLength) lineLength = DEFAULT_LINE_LENGTH;
-
-    if (currentGame == SGMDE && lineLength == 252) lineDisplayCount = 2;
-    sc3String.push_back(0xFF);
-    sc3String.push_back(0xFF);
-    std::list<StringWord_t> words;
-    semiTokeniseSc3String(sc3String.data(), words, baseGlyphSize, lineLength);
-    processSc3TokenList(xOffset, yOffset, lineLength, words, lineSkipCount,
-                        color, baseGlyphSize, &str, true, COORDS_MULTIPLIER, -1,
-                        NOT_A_LINK, color, baseGlyphSize, nullptr);
-    processSc3TokenList(xOffset, yOffset, lineLength, words, lineDisplayCount,
-                        color, baseGlyphSize, &str, false, COORDS_MULTIPLIER,
-                        str.linkCount - 1, str.curLinkNumber, str.curColor,
-                        baseGlyphSize, nullptr);
-    for (int i = 0; i < str.length; i++) {
-      gameExeDrawGlyph(textureId, str.textureStartX[i], str.textureStartY[i],
-                       str.textureWidth[i], str.textureHeight[i],
-                       str.displayStartX[i], str.displayStartY[i],
-                       str.displayEndX[i], str.displayEndY[i], str.color[i],
-                       opacity);
-    }
-
-
-    return (baseGlyphSize >> 1);
-  }
-
-
-
-
-
 
 signed int drawSingleTextLineHook(int textureId, int startX, signed int startY,
                                   unsigned int a4, char* string,
@@ -2839,20 +3222,96 @@ signed int drawSingleTextLineHook(int textureId, int startX, signed int startY,
     startY += fixIter->second.dy;
     if (fixIter->second.fontSize) glyphSize = fixIter->second.fontSize;
   }
+  if (SINGLE_LINE_DEBUG) {
+    std::stringstream dbg;
+    dbg << "drawSingleTextLine: ret=" << std::hex << retaddr << std::dec
+        << " tex=" << textureId << " startX=" << startX << " startY=" << startY
+        << " a4=" << a4 << " maxLen=" << maxLength << " color=" << color
+        << " glyphSize=" << glyphSize << " opacity=" << opacity << " text=";
+    const unsigned char* p = (const unsigned char*)string;
+    for (int n = 0; n < 60 && *p != 0xFF; n++) {
+      if (*p >= 0x80) {
+        const int gid = ((*p & 0x7F) << 8) | p[1];
+        if (gid < (int)TextRendering::Get().fullCharMap.size())
+          dbg << (char)TextRendering::Get().fullCharMap[gid];
+        p += 2;
+      } else {
+        dbg << '<' << (int)*p << '>';
+        p += 1;
+      }
+    }
+    LanguageBarrierLog(dbg.str());
+  }
   return gameExeDrawSingleTextLineReal(textureId, startX, startY, a4, string,
                                        maxLength, color, glyphSize, opacity);
+}
+
+// Append the day marker to a mail date's day number, in place.
+//
+// The English mail layout ends the date with a bare day number ("9/2"), while
+// the Japanese one carries its own 日 slot. So a Chinese date in the English
+// layout has to grow the marker itself.
+//
+// This runs from the width hook, on the buffer the caller is about to measure
+// and then draw: the same stack buffer serves both. Inserting before the 0xFF
+// terminator therefore both reserves the extra cell (the block is right
+// anchored, so it slides left instead of overrunning the panel) and gets the
+// glyph drawn. Measured-only or drawn-only would give a shifted block or a
+// marker past the edge.
+static void appendMailDayMarker(char* sc3string, unsigned int maxCharacters) {
+  if (TextRendering::Get().fullCharMap.empty()) return;
+  const size_t dayId = TextRendering::Get().fullCharMap.find(L'\u65e5');
+  if (dayId == std::wstring::npos || dayId > 0x7FFF) return;
+
+  // The caller's buffer runs from ebp-0x104 up to the stack cookie at ebp-4, so
+  // it holds 0x100 bytes and a glyph costs two. Never scan further than that:
+  // the caller passes 0 for maxCharacters, which the hook widens to 255 -- more
+  // than the buffer can hold, so bounding by that alone would read past it.
+  const unsigned int limit = min(maxCharacters, (unsigned int)(0x100 / 2) - 1);
+
+  // Walk to the terminator. Anything but plain glyphs means this is not the
+  // shape we expect, so leave the string alone.
+  char* p = sc3string;
+  unsigned int glyphs = 0;
+  int lastGlyph = -1;
+  while (glyphs <= limit) {
+    const unsigned char c = (unsigned char)*p;
+    if (c == 0xFF) break;
+    if (c >= 0x80) {
+      lastGlyph = ((c & 0x7F) << 8) | (unsigned char)p[1];
+      p += 2;
+    } else {
+      return;
+    }
+    glyphs++;
+  }
+  if ((unsigned char)*p != 0xFF) return;
+  // Already marked: the hook can see the same buffer more than once.
+  if (lastGlyph == (int)dayId) return;
+  // The date number is a digit or two; refuse anything longer so a surprise
+  // string cannot run past the caller's buffer.
+  if (glyphs > 8) return;
+
+  p[0] = (char)(0x80 | (dayId >> 8));
+  p[1] = (char)(dayId & 0xFF);
+  p[2] = (char)0xFF;
 }
 
 int __cdecl getSc3StringDisplayWidthHook(char* sc3string,
                                          unsigned int maxCharacters,
                                          int baseGlyphSize) {
   if (!maxCharacters) maxCharacters = DEFAULT_MAX_CHARACTERS;
+  if (MAIL_DAY_MARKER && gameExeMailDayMeasureRet &&
+      (uintptr_t)_ReturnAddress() == gameExeMailDayMeasureRet) {
+    appendMailDayMarker(sc3string, maxCharacters);
+  }
   ScriptThreadState sc3;
   int sc3evalResult;
   int result = 0;
   int i = 0;
   signed char c;
   FontData* fontData;
+  bool insideRubyText = false;
   if (UseNewTextSystem)
     fontData = TextRendering::Get().getFont(baseGlyphSize, true);
   while (i <= maxCharacters && (c = *sc3string) != -1) {
@@ -2860,19 +3319,27 @@ int __cdecl getSc3StringDisplayWidthHook(char* sc3string,
       sc3.pc = sc3string + 1;
       gameExeSc3Eval(&sc3, &sc3evalResult);
       sc3string = (char*)sc3.pc;
+    } else if ((uint8_t)c == 0x80 && sc3string[1] >= 9 &&
+               sc3string[1] <= 11 &&
+               (RUBY_MARKERS_ENABLED && (sc3string[1] == 10 || insideRubyText))) {
+      if (sc3string[1] == 10) insideRubyText = true;
+      if (sc3string[1] == 11) insideRubyText = false;
+      sc3string += 2;
     } else if (c < 0) {
       int glyphId = (uint8_t)sc3string[1] + ((c & 0x7f) << 8);
-      if (UseNewTextSystem) {
-        if (TextRendering::Get().enabled) {
-          int adv = fontData->getGlyphInfo(glyphId, Regular)->advance;
-          result += adv;
+      if (!insideRubyText) {
+        if (UseNewTextSystem) {
+          if (TextRendering::Get().enabled) {
+            int adv = fontData->getGlyphInfo(glyphId, Regular)->advance;
+            result += adv;
+          } else {
+            result += TextRendering::Get().originalWidth[glyphId];
+          }
         } else {
-          result += TextRendering::Get().originalWidth[glyphId];
+          result += (baseGlyphSize * widths[glyphId]) / FONT_CELL_WIDTH;
         }
-      } else {
-        result += (baseGlyphSize * widths[glyphId]) / FONT_CELL_WIDTH;
+        i++;
       }
-      i++;
       sc3string += 2;
     }
   }
@@ -2888,7 +3355,6 @@ int __cdecl sghdGetLinksFromSc3StringHook(int xOffset, int yOffset,
   ProcessedSc3String_t str;
 
   if (!lineLength) lineLength = DEFAULT_LINE_LENGTH;
-  if (lineLength == 0x116 && currentGame == SGLBP) lineLength = 0x114;
 
   std::list<StringWord_t> words;
   semiTokeniseSc3String(sc3string, words, baseGlyphSize, lineLength);
@@ -2900,7 +3366,6 @@ int __cdecl sghdGetLinksFromSc3StringHook(int xOffset, int yOffset,
                       str.curLinkNumber, str.curColor, baseGlyphSize, NULL);
 
   int j = 0;
-  ;
   for (int i = 0; i < str.length; i++) {
     if (str.linkNumber[i] != NOT_A_LINK) {
       result[j].linkNumber = str.linkNumber[i];
@@ -2966,6 +3431,7 @@ int __cdecl sghdDrawLinkHighlightHook(int xOffset, int yOffset, int lineLength,
                                       unsigned int baseGlyphSize, int opacity,
                                       int selectedLink) {
   ProcessedSc3String_t str;
+
   if (!lineLength) lineLength = DEFAULT_LINE_LENGTH;
 
   std::list<StringWord_t> words;
@@ -3001,12 +3467,6 @@ int __cdecl getSc3StringLineCountHook(int lineLength, char* sc3string,
   processSc3TokenList(0, 0, lineLength, words, LINECOUNT_DISABLE_OR_ERROR, 0,
                       baseGlyphSize, &str, true, 1.0f, -1, NOT_A_LINK, 0,
                       baseGlyphSize, NULL);
-  if (currentGame == SGLBP && lineLength == 254 && str.lines > 0)
-    return str.lines;
-
-  if (currentGame == SGMDE && lineLength == 252 && str.lines > 0)
-    return str.lines;
-
   return str.lines + 1;
 }
 int __cdecl getRineInputRectangleHook(int* lineLength, char* text,
@@ -3028,6 +3488,17 @@ int sg0DrawGlyphHook(int textureId, float glyphInTextureStartX,
                      float glyphInTextureHeight, float displayStartX,
                      float displayStartY, float displayEndX, float displayEndY,
                      int color, uint32_t opacity) {
+  // Same region filter as sg0DrawGlyph2Hook: see GLYPH_DEBUG in GameText.h.
+  if (GLYPH_DEBUG && displayStartY >= 450.0f && displayStartY <= 800.0f) {
+    std::stringstream dbg;
+    dbg << "sg0DrawGlyph: ret=" << std::hex << (uintptr_t)_ReturnAddress()
+        << std::dec << " tex=" << textureId << " src=("
+        << glyphInTextureStartX << "," << glyphInTextureStartY << ") "
+        << glyphInTextureWidth << "x" << glyphInTextureHeight << " dispStart=("
+        << displayStartX << "," << displayStartY << ") dispEnd=(" << displayEndX
+        << "," << displayEndY << ")";
+    LanguageBarrierLog(dbg.str());
+  }
   if (!HAS_SPLIT_FONT) {
     if (glyphInTextureStartY > 4080.0) {
       glyphInTextureStartY += 4080.0;
@@ -3046,7 +3517,6 @@ int sg0DrawGlyphHook(int textureId, float glyphInTextureStartX,
       ++textureId;
     }
   }
-
   return gameExeDrawGlyphReal(
       textureId, glyphInTextureStartX, glyphInTextureStartY,
       glyphInTextureWidth, glyphInTextureHeight, displayStartX, displayStartY,
@@ -3058,6 +3528,17 @@ int rnDrawGlyphHook(int textureId, float glyphInTextureStartX,
                     float glyphInTextureHeight, float displayStartX,
                     float displayStartY, float displayEndX, float displayEndY,
                     int color, uint32_t opacity) {
+  // Same region filter as sg0DrawGlyph2Hook: see GLYPH_DEBUG in GameText.h.
+  if (GLYPH_DEBUG && displayStartY >= 450.0f && displayStartY <= 800.0f) {
+    std::stringstream dbg;
+    dbg << "rnDrawGlyph: ret=" << std::hex << (uintptr_t)_ReturnAddress()
+        << std::dec << " tex=" << textureId << " src=("
+        << glyphInTextureStartX << "," << glyphInTextureStartY << ") "
+        << glyphInTextureWidth << "x" << glyphInTextureHeight << " dispStart=("
+        << displayStartX << "," << displayStartY << ") dispEnd=(" << displayEndX
+        << "," << displayEndY << ")";
+    LanguageBarrierLog(dbg.str());
+  }
   if (TextRendering::Get().enabled) {
     //	if (textureId == FIRST_FONT_ID)
     //		textureId = TextRendering::Get().FONT_TEXTURE_ID;
@@ -3072,8 +3553,8 @@ int rnDrawGlyphHook(int textureId, float glyphInTextureStartX,
       displayEndX, displayEndY, color, opacity);
 }
 
-int __cdecl rnDrawTextHook(signed int textureId, int xOffset, signed int startY,
-                           unsigned int lineSize, uint8_t* sc3, signed int startX,
+int __cdecl rnDrawTextHook(signed int textureId, int a2, signed int startY,
+                           unsigned int a4, uint8_t* sc3, signed int startX,
                            int color, int height, int opacity) {
   int length = 0;
 
@@ -3082,25 +3563,46 @@ int __cdecl rnDrawTextHook(signed int textureId, int xOffset, signed int startY,
   std::vector<uint16_t> v;
   std::vector<wchar_t> v2;
 
+  if (RN_DRAW_TEXT_DEBUG) {
+    std::stringstream dbg;
+    dbg << "rnDrawText: ret=" << std::hex << (uintptr_t)_ReturnAddress()
+        << std::dec << " startX=" << startX << " startY=" << startY
+        << " a2=" << a2 << " a4=" << a4 << " height=" << height
+        << " color=" << color << " opacity=" << opacity << " text=";
+    const unsigned char* p = (const unsigned char*)sc3;
+    for (int n = 0; n < 60 && *p != 0xFF; n++) {
+      if (*p >= 0x80) {
+        const int gid = ((*p & 0x7F) << 8) | p[1];
+        if (gid < (int)TextRendering::Get().fullCharMap.size())
+          dbg << (char)TextRendering::Get().fullCharMap[gid];
+        p += 2;
+      } else {
+        dbg << '<' << (int)*p << '>';
+        p += 1;
+      }
+    }
+    LanguageBarrierLog(dbg.str());
+  }
+
   if (TextRendering::Get().enabled) {
-    if (lineSize == 0x104 && height == 0x18) {
-      lineSize *= 1.33;
+    if (a4 == 0x104 && height == 0x18) {
+      a4 *= 1.33;
       height *= 1.33;
     }
-    int width = lineSize * 1.5 + 1;
-    while (lineSize != 0 && width > lineSize * 1.5 && height > 0) {
+    int width = a4 * 1.5 + 1;
+    while (a4 != 0 && width > a4 * 1.5 && height > 0) {
       width = getSc3StringDisplayWidthHook((char*)sc3, 0, height * 1.5);
       height--;
     }
     std::list<StringWord_t> words;
 
-    semiTokeniseSc3String((char*)sc3, words, height * 1.5, lineSize * 1.5);
+    semiTokeniseSc3String((char*)sc3, words, height * 1.5, a4 * 1.5);
     int xOffset, yOffset;
     xOffset = 0;
     yOffset = 0;
     int lineSkipCount = 1;
     int lineDisplayCount = 0;
-    int lineLength = lineSize * 1.5;
+    int lineLength = a4 * 1.5;
     const int glyphSize = height * 1.5;
 
     ProcessedSc3String_t str;
@@ -3108,9 +3610,9 @@ int __cdecl rnDrawTextHook(signed int textureId, int xOffset, signed int startY,
     mData.xOffset = 1.5f;
     mData.yOffset = 1.5f;
     mData.displayYOffset = -6.0f * glyphSize / 48.0f;
-    if (lineSize == 0) lineSize = 10000;
+    if (a4 == 0) a4 = 10000;
 
-    processSc3TokenList(xOffset, startY, lineSize * 2.5f, words, 1, color, glyphSize, &str,
+    processSc3TokenList(a2, startY, a4 * 2.5f, words, 1, color, glyphSize, &str,
                         false, COORDS_MULTIPLIER, 0, 0, color, glyphSize,
                         &mData);
 
@@ -3176,14 +3678,11 @@ int __cdecl rnDrawTextHook(signed int textureId, int xOffset, signed int startY,
 
             }*/
   } else {
-    rnDrawTextReal(textureId, xOffset, startY, lineSize, sc3, startX, color, height,
+    rnDrawTextReal(textureId, a2, startY, a4, sc3, startX, color, height,
                    opacity);
   }
   return 1;
 }
-
-
-
 
 unsigned int sg0DrawGlyph2Hook(int textureId, int a2,
                                float glyphInTextureStartX,
@@ -3193,6 +3692,20 @@ unsigned int sg0DrawGlyph2Hook(int textureId, int a2,
                                float a9, float a10, float a11, float a12,
                                signed int inColor, signed int opacity, int* a15,
                                int* a16) {
+  // Log glyphs drawn into the EXTRA screen's stat rows, so the call site that
+  // places those numbers can be identified (a9/a10 are the display position).
+  // The filter is deliberately loose: the exact coordinate space is not known
+  // up front, so it only excludes the far edges of the frame.
+  if (GLYPH_DEBUG && a10 >= 450.0f && a10 <= 800.0f) {
+    std::stringstream dbg;
+    dbg << "sg0DrawGlyph2: ret=" << std::hex << (uintptr_t)_ReturnAddress()
+        << std::dec << " tex=" << textureId << " src=("
+        << glyphInTextureStartX << "," << glyphInTextureStartY << ") "
+        << glyphInTextureWidth << "x" << glyphInTextureHeight << " disp=("
+        << a9 << "," << a10 << ") a7=" << a7 << " a8=" << a8
+        << " a11=" << a11 << " a12=" << a12;
+    LanguageBarrierLog(dbg.str());
+  }
   if (!HAS_SPLIT_FONT) {
     if (glyphInTextureStartY > 4080.0) {
       glyphInTextureStartY += 4080.0;
@@ -3235,18 +3748,17 @@ unsigned int sg0DrawGlyph2Hook(int textureId, int a2,
 }
 
 unsigned int sg0DrawGlyph3Hook(int textureId, int maskTextureId,
-                               float textureStartX, float textureStartY,
-                               float textureSizeX, float textureSizeY,
-                               float startPosX, float startPosY, float EndPosX,
-                               float EndPosY, int color, int opacity) {
+                               int textureStartX, int textureStartY,
+                               int textureSizeX, int textureSizeY,
+                               int startPosX, int startPosY, int EndPosX,
+                               int EndPosY, int color, int opacity) {
   return gameExeSg0DrawGlyph3Real(
       textureId, maskTextureId, textureStartX, textureStartY, textureSizeX,
       textureSizeY, startPosX, startPosY, EndPosX, EndPosY, color, opacity);
 }
 
 int setTipContentHook(char* sc3string) {
-  if (TextRendering::Get().enabled && currentGame != SGLBP)
-    return gameExeSetTipContentReal(sc3string);
+  if (!TextRendering::Get().enabled) return gameExeSetTipContentReal(sc3string);
   tipContent = sc3string;
   ProcessedSc3String_t str;
 
@@ -3266,10 +3778,7 @@ int setTipContentHook(char* sc3string) {
                       TIP_REIMPL_GLYPH_SIZE, &str, false, COORDS_MULTIPLIER, -1,
                       NOT_A_LINK, 0, TIP_REIMPL_GLYPH_SIZE * 1.5f, &mData);
 
-  auto scrollHeight = str.displayEndY[str.length - 1];
-
-  if (currentGame == SGLBP) return scrollHeight / 1.5f;
-  return scrollHeight;
+  return str.displayEndY[str.length - 1];  // scroll height
 }
 
 void drawReportContentHook(int textureId, int maskId, int a3, int a4,
@@ -3337,7 +3846,7 @@ void drawReportContentHook(int textureId, int maskId, int a3, int a4,
         gameExeSg0DrawGlyph2(
             TextRendering::Get().FONT_TEXTURE_ID, maskId, str.textureStartX[i],
             str.textureStartY[i], str.textureWidth[i], str.textureHeight[i],
-            a3 * 2, (maskY) * 2 + 64 - glyphInfo->top,
+            a3 * 2, (maskY)*2 + 64 - glyphInfo->top,
             ((float)str.displayStartX[i] + (1.0f * COORDS_MULTIPLIER)),
             ((float)str.displayStartY[i] - glyphInfo->top + 64 +
              ((1.0f + (float)0) * COORDS_MULTIPLIER)),
@@ -3349,7 +3858,7 @@ void drawReportContentHook(int textureId, int maskId, int a3, int a4,
         gameExeSg0DrawGlyph2(TextRendering::Get().FONT_TEXTURE_ID, maskId,
                              str.textureStartX[i], str.textureStartY[i],
                              str.textureWidth[i], str.textureHeight[i], a3 * 2,
-                             (maskY) * 2 + 64 - glyphInfo->top,
+                             (maskY)*2 + 64 - glyphInfo->top,
                              (float)str.displayStartX[i],
                              (float)str.displayStartY[i] - glyphInfo->top + 64,
                              (float)str.displayEndX[i],
@@ -3420,10 +3929,16 @@ void drawTipContentHook(int textureId, int maskId, int startX, int startY,
   int dummy1;
   int dummy2;
   char name[256];
-  gameExeDrawTipContentReal(textureId, maskId, startX, startY, maskStartY,
-                            maskHeight, a7, color, shadowColor, opacity);
-  return;
-  if (!TextRendering::Get().enabled && currentGame != SGLBP) {
+  /*	if (GetAsyncKeyState(VK_RBUTTON)) {
+                  TextRendering::Get().enableReplacement();
+          }
+          if (GetAsyncKeyState(VK_LBUTTON)) {
+                  TextRendering::Get().disableReplacement();
+
+          }
+          */
+
+  if (!TextRendering::Get().enabled) {
     gameExeDrawTipContentReal(textureId, maskId, startX, startY, maskStartY,
                               maskHeight, a7, color, shadowColor, opacity);
     return;
@@ -3443,66 +3958,68 @@ void drawTipContentHook(int textureId, int maskId, int startX, int startY,
   processSc3TokenList(startX, startY, TIP_REIMPL_LINE_LENGTH, words, 255, color,
                       TIP_REIMPL_GLYPH_SIZE, &str, false, COORDS_MULTIPLIER, -1,
                       NOT_A_LINK, color, TIP_REIMPL_GLYPH_SIZE * 1.5f, &mData);
+  TextRendering::Get().replaceFontSurface(TIP_REIMPL_GLYPH_SIZE);
+  auto fontData = TextRendering::Get().getFont(TIP_REIMPL_GLYPH_SIZE, false);
+  maskHeight *= 1.5f;
+  for (int i = 0; i < str.length; i++) {
+    if (str.displayStartY[i] / COORDS_MULTIPLIER > maskStartY &&
+        str.displayEndY[i] / COORDS_MULTIPLIER <
+            (maskStartY + maskHeight) * 1.0f) {
+      auto glyphInfo = fontData->getGlyphInfo(str.glyph[i], FontType::Regular);
 
-  if (TextRendering::Get().enabled) {
-    TextRendering::Get().replaceFontSurface(TIP_REIMPL_GLYPH_SIZE);
-    auto fontData = TextRendering::Get().getFont(TIP_REIMPL_GLYPH_SIZE, false);
-    maskHeight *= 1.5f;
-    for (int i = 0; i < str.length; i++) {
-      if (str.displayStartY[i] / COORDS_MULTIPLIER > maskStartY &&
-          str.displayEndY[i] / COORDS_MULTIPLIER <
-              (maskStartY + maskHeight) * 1.0f) {
-        auto glyphInfo =
-            fontData->getGlyphInfo(str.glyph[i], FontType::Regular);
+      gameExeSg0DrawGlyph2(
+          TextRendering::Get().FONT_TEXTURE_ID, maskId, str.textureStartX[i],
+          str.textureStartY[i], str.textureWidth[i], str.textureHeight[i],
+          ((float)str.displayStartX[i] + (1.0f * COORDS_MULTIPLIER)),
+          ((float)str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE -
+           glyphInfo->top + (1.0f * COORDS_MULTIPLIER)),
+          ((float)str.displayStartX[i] + (1.0f * COORDS_MULTIPLIER)),
+          ((float)str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE -
+           glyphInfo->top + ((1.0f + (float)a7) * COORDS_MULTIPLIER)),
+          ((float)str.displayEndX[i] + (1.0f * COORDS_MULTIPLIER)),
+          ((float)str.displayEndY[i] + TIP_REIMPL_GLYPH_SIZE - glyphInfo->top +
+           ((1.0f + (float)a7) * COORDS_MULTIPLIER)),
+          shadowColor, opacity, &dummy1, &dummy2);
 
-        gameExeSg0DrawGlyph2(
-            TextRendering::Get().FONT_TEXTURE_ID, maskId, str.textureStartX[i],
-            str.textureStartY[i], str.textureWidth[i], str.textureHeight[i],
-            ((float)str.displayStartX[i] + (1.0f * COORDS_MULTIPLIER)),
-            ((float)str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE -
-             glyphInfo->top + (1.0f * COORDS_MULTIPLIER)),
-            ((float)str.displayStartX[i] + (1.0f * COORDS_MULTIPLIER)),
-            ((float)str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE -
-             glyphInfo->top + ((1.0f + (float)a7) * COORDS_MULTIPLIER)),
-            ((float)str.displayEndX[i] + (1.0f * COORDS_MULTIPLIER)),
-            ((float)str.displayEndY[i] + TIP_REIMPL_GLYPH_SIZE -
-             glyphInfo->top + ((1.0f + (float)a7) * COORDS_MULTIPLIER)),
-            shadowColor, opacity, &dummy1, &dummy2);
-
-        gameExeSg0DrawGlyph2(
-            TextRendering::Get().FONT_TEXTURE_ID, maskId, str.textureStartX[i],
-            str.textureStartY[i], str.textureWidth[i], str.textureHeight[i],
-            str.displayStartX[i],
-            str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE - glyphInfo->top,
-            str.displayStartX[i],
-            ((float)str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE -
-             glyphInfo->top + ((float)a7 * COORDS_MULTIPLIER)),
-            str.displayEndX[i],
-            ((float)str.displayEndY[i] + TIP_REIMPL_GLYPH_SIZE -
-             glyphInfo->top + ((float)a7 * COORDS_MULTIPLIER)),
-            str.color[i], opacity, &dummy1, &dummy2);
-      }
-    }
-  }
-
-  else {
-    maskHeight *= 1.5f;
-    for (int i = 0; i < str.length; i++) {
-      if (str.displayStartY[i] / COORDS_MULTIPLIER > maskStartY &&
-          str.displayEndY[i] / COORDS_MULTIPLIER <
-              (maskStartY + maskHeight) * 1.0f) {
-        sg0DrawGlyph3Hook(0x4F, maskId, str.textureStartX[i],
-                          str.textureStartY[i], str.textureWidth[i],
-                          str.textureHeight[i], str.displayStartX[i],
-                          str.displayStartY[i], str.displayEndX[i],
-                          str.displayEndY[i], 0xFFFFFFFF, opacity);
-      }
+      gameExeSg0DrawGlyph2(
+          TextRendering::Get().FONT_TEXTURE_ID, maskId, str.textureStartX[i],
+          str.textureStartY[i], str.textureWidth[i], str.textureHeight[i],
+          str.displayStartX[i],
+          str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE - glyphInfo->top,
+          str.displayStartX[i],
+          ((float)str.displayStartY[i] + TIP_REIMPL_GLYPH_SIZE -
+           glyphInfo->top + ((float)a7 * COORDS_MULTIPLIER)),
+          str.displayEndX[i],
+          ((float)str.displayEndY[i] + TIP_REIMPL_GLYPH_SIZE - glyphInfo->top +
+           ((float)a7 * COORDS_MULTIPLIER)),
+          str.color[i], opacity, &dummy1, &dummy2);
     }
   }
 }
 int drawSpriteHook(int textureId, float spriteX, float spriteY,
                    float spriteWidth, float spriteHeight, float displayX,
                    float displayY, int color, int opacity, int shaderId) {
+  // Log every distinct sprite blit once (deduplicated), so a short visit to a
+  // screen yields a complete, small inventory of what it draws. Used to find
+  // the call site that blits the EXTRA screen's stat rows.
+  if (SPRITE_DEBUG) {
+    static std::set<std::string> spriteDebugSeen;
+    if (spriteDebugSeen.size() < 5000) {
+      std::stringstream key;
+      key << std::hex << (uintptr_t)_ReturnAddress() << std::dec << '|'
+          << textureId << '|' << spriteX << ',' << spriteY << ',' << spriteWidth
+          << ',' << spriteHeight << '|' << displayX << ',' << displayY;
+      if (spriteDebugSeen.insert(key.str()).second) {
+        std::stringstream dbg;
+        dbg << "drawSprite: ret=" << std::hex << (uintptr_t)_ReturnAddress()
+            << std::dec << " tex=" << textureId << " src=(" << spriteX << ","
+            << spriteY << ") " << spriteWidth << "x" << spriteHeight << " disp=("
+            << displayX << "," << displayY << ") color=" << color
+            << " opacity=" << opacity << " shader=" << shaderId;
+        LanguageBarrierLog(dbg.str());
+      }
+    }
+  }
   if (CC_BACKLOG_HIGHLIGHT &&
       _ReturnAddress() == gameExeCcBacklogHighlightDrawRet) {
     spriteHeight =
@@ -3534,94 +4051,4 @@ int drawSpriteHook(int textureId, float spriteX, float spriteY,
                                spriteHeight, displayX, displayY, color, opacity,
                                shaderId);
 }
-
-void __cdecl sgpDrawMailTextHook(int startX, int startY, char* sc3String,
-                                 unsigned int lineLength, int opacity) {
-  char* currentSc3;  // edi
-  unsigned int v6;   // ebx
-  char i;            // al
-  unsigned int v8;   // edx
-  int v9;            // eax
-  int v10;           // esi
-  int v11;           // [esp+44h] [ebp+10h]
-
-  ProcessedSc3String_t strsc3;
-
-  if (!lineLength) lineLength = DEFAULT_LINE_LENGTH;
-  uint8_t glyphSize = 0x18;
-  std::list<StringWord_t> words;
-  semiTokeniseSc3String(sc3String, words, 0x18, lineLength);
-  processSc3TokenList(startX, startY, lineLength, words, 1, 0xFFFFFF, 0x18,
-                      &strsc3, false, COORDS_MULTIPLIER, 0, 0, 0xFFFFFF, 0x12,
-                      nullptr);
-  for (int i = 0; i < strsc3.length; i++) {
-    sg0DrawGlyph3Hook(0x4F, 168, strsc3.textureStartX[i],
-                      strsc3.textureStartY[i], strsc3.textureWidth[i],
-                      strsc3.textureHeight[i], strsc3.displayStartX[i],
-                      strsc3.displayStartY[i], strsc3.displayEndX[i],
-                      strsc3.displayEndY[i], strsc3.color[i], opacity);
-  }
-
-  return;
-
-  currentSc3 = sc3String;
-  v6 = 0;
-  for (i = *sc3String; *currentSc3 != -1; i = *currentSc3) {
-    if (i >= 0) {
-      if (!i) return;
-      if (i == 9 || i == 11) ++currentSc3;
-    } else {
-      v8 = (unsigned __int8)currentSc3[1] + ((i & 0x7F) << 8);
-      currentSc3 += 2;
-      if (v8 < 0x80 && v8) {
-        v9 = 12;
-        v11 = 18;
-      } else {
-        v9 = 24;
-        v11 = 32;
-      }
-      v6 += v9;
-      if (v6 > lineLength) return;
-      v10 = v9 + startX;
-      gameExeSg0DrawGlyph3(
-          0x4F, 168, (float)(int)(32 * (v8 - (v8 >> 6 << 6)) + 1) * 1.5,
-          (float)(int)(32 * (v8 >> 6) + 1) * 1.5, (float)(v11 - 2) * 1.5, 45.0,
-          (float)(startX + 1) * 1.5, (float)(startY + 1) * 1.5,
-          (float)(v9 + startX + 1) * 1.5, (float)(startY + 25) * 1.5,
-          (int)0xFFFFFFFF, opacity);
-      startX = v10;
-    }
-  }
-}
-
-void __cdecl sgpDrawMailTextContentHook(int startX, int startY, char* sc3String,
-                                        unsigned int lineLength, int opacity,
-                                        int a6, int a7) {
-  char* currentSc3;  // edi
-  unsigned int v6;   // ebx
-  char i;            // al
-  unsigned int v8;   // edx
-  int v9;            // eax
-  int v10;           // esi
-  int v11;           // [esp+44h] [ebp+10h]
-
-  ProcessedSc3String_t strsc3;
-
-  if (!lineLength) lineLength = DEFAULT_LINE_LENGTH;
-  uint8_t glyphSize = 0x18;
-  std::list<StringWord_t> words;
-  semiTokeniseSc3String(sc3String, words, 0x18, lineLength);
-  processSc3TokenList(startX, startY, lineLength, words, 40, 0xFFFFFF, 0x18,
-                      &strsc3, false, COORDS_MULTIPLIER, 0, 0, 0xFFFFFF, 0x18,
-                      nullptr);
-  for (int i = 0; i < strsc3.length; i++) {
-    sg0DrawGlyph3Hook(0x4F, 168, strsc3.textureStartX[i],
-                      strsc3.textureStartY[i], strsc3.textureWidth[i],
-                      strsc3.textureHeight[i], strsc3.displayStartX[i],
-                      strsc3.displayStartY[i], strsc3.displayEndX[i],
-                      strsc3.displayEndY[i], strsc3.color[i], opacity);
-  }
-  return;
-}
-
 }  // namespace lb

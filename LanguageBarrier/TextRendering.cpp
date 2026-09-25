@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <codecvt>
+#include <cstdio>
 #include <freetype/ftdriver.h>
 #include <freetype/ftmodapi.h>
 void to_json(nlohmann::json& j, const FontGlyph& p) {
@@ -51,10 +52,47 @@ void TextRendering::enableReplacement() {
 
 TextRendering::TextRendering() {}
 
+uint32_t TextRendering::computeCharsetHash(const std::wstring& charset) {
+  uint32_t hash = 2166136261u;  // FNV-1a 32-bit offset basis
+  for (wchar_t c : charset) {
+    hash ^= (uint32_t)(uint16_t)c;
+    hash *= 16777619u;
+    hash ^= (uint32_t)(uint16_t)(c >> 16);
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
 void TextRendering::Init(void* widthData, void* widthData2,
                          FontDataLanguage language) {
-  LoadCharset();
+  auto charset = lb::config["patch"]["charset"].get<std::string>();
   this->fontPath = lb::config["patch"]["fontPath"].get<std::string>();
+  if (lb::config["patch"].count("narrowQuotes") == 1)
+    this->narrowQuotes = lb::config["patch"]["narrowQuotes"].get<bool>();
+  if (lb::config["patch"].count("quoteWidthPixels") == 1)
+    this->quoteWidth32 =
+        lb::config["patch"]["quoteWidthPixels"].get<uint16_t>();
+  if (lb::config["patch"].count("quoteInsetPixels") == 1)
+    this->quoteInset32 =
+        lb::config["patch"]["quoteInsetPixels"].get<uint16_t>();
+  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
+  fullCharMap = converter.from_bytes(charset.c_str());
+  this->charsetHash = computeCharsetHash(fullCharMap);
+  // Fold the glyph-metric overrides into the same fingerprint the cache check
+  // uses. These change baked advances without changing the charset, so without
+  // this a cache written before the change would still validate and the new
+  // metrics would never be applied -- the same silent-no-op shape that bit the
+  // ruby table and the backlog columns.
+  {
+    uint32_t h = this->charsetHash;
+    h ^= (uint32_t)this->narrowQuotes;
+    h *= 16777619u;
+    h ^= this->quoteWidth32;
+    h *= 16777619u;
+    h ^= this->quoteInset32;
+    h *= 16777619u;
+    this->charsetHash = h;
+  }
 
   currentCharMap = &fullCharMap;
   this->buildFont(32, true);
@@ -63,12 +101,19 @@ void TextRendering::Init(void* widthData, void* widthData2,
 
   filteredCharMap.reserve(fullCharMap.length());
   initFT(32);
+  // allow overriding exclusion of CJK unified ideographs via config
+  bool forceIncludeHan = false;
+  try {
+    forceIncludeHan = lb::config["patch"].value<bool>("forceIncludeHan", false);
+  } catch (...) { /* ignore */ }
+  this->forceIncludeHan = forceIncludeHan;
+
   for (int i = 0; i < fullCharMap.length(); i++) {
     int glyph_index = FT_Get_Char_Index(this->ftFace, fullCharMap[i]);
 
+    bool isHan = (fullCharMap[i] >= 0x4E00 && fullCharMap[i] <= 0x9faf);
     if (glyph_index &&
-        (!(fullCharMap[i] >= 0x4E00 && fullCharMap[i] <= 0x9faf) ||
-         language == JP) &&
+        ((!isHan) || language == JP || forceIncludeHan) &&
         filteredCharMap.find(fullCharMap[i]) == currentCharMap->npos)
       filteredCharMap.push_back(fullCharMap[i]);
   }
@@ -87,6 +132,24 @@ void TextRendering::Init(void* widthData, void* widthData2,
     this->widthData[i] = newWidth[i];
     this->widthData2[i] = newWidth[i];
   }
+  // Quotes live past the first 351 cells, so the loop above never reached them.
+  // The game reads their widths out of this very table to decide where lines
+  // wrap, so the narrowed step has to land here too -- otherwise the layout
+  // still budgets a full cell per bracket and wrapping disagrees with drawing.
+  if (this->narrowQuotes) {
+    static const wchar_t kQuotes[] = {0x300C, 0x300D, 0x300E, 0x300F};
+    for (wchar_t q : kQuotes) {
+      const size_t id = fullCharMap.find(q);
+      if (id == std::wstring::npos || id >= 32000) continue;
+      const uint8_t w = (uint8_t)this->getFont(32, true)
+                            ->getGlyphInfo((int)id, FontType::Regular)
+                            ->advance;
+      newWidth[id] = w;
+      newWidth2[id] = w;
+      this->widthData[id] = w;
+      this->widthData2[id] = w;
+    }
+  }
   this->fontData.erase(32);
   this->widthData[0] = lb::config["patch"]["spaceWidthPixels"].get<uint16_t>();
   this->widthData[lb::config["gamedef"]["glyphIdFullwidthSpace"]
@@ -95,12 +158,11 @@ void TextRendering::Init(void* widthData, void* widthData2,
   ;
 }
 
-void TextRendering::LoadCharset() {
-  if (lb::config["patch"].count("charset") > 0) {
-    auto charset = lb::config["patch"]["charset"].get<std::string>();
-    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-    fullCharMap = converter.from_bytes(charset.c_str());
+wchar_t TextRendering::getCharForGlyphId(int glyphId) const {
+  if (glyphId < 0 || glyphId >= (int)fullCharMap.size()) {
+    return L' ';
   }
+  return fullCharMap[glyphId];
 }
 
 struct TextSize {
@@ -114,6 +176,7 @@ void TextRendering::buildFont(int fontSize, bool measure) {
   this->fontData[fontSize] = FontData();
   auto fontData = &this->fontData[fontSize];
   fontData->lang = this->language;
+  fontData->charsetHash = this->charsetHash;
   NUM_GLYPHS = currentCharMap->length();
   if (!measure) {
     fontData->fontTexture.Initialize2D(
@@ -397,6 +460,13 @@ void TextRendering::saveCache() {
 
   for (auto it = this->fontData.begin(); it != this->fontData.end();) {
     if (it->second.fontTexturePtr == nullptr) {
+      // Drop the atlas alongside the index entry, otherwise a later session can
+      // load an index whose font_NN.dds no longer exists and draw nothing.
+      wchar_t atlasName[260];
+      wsprintf(atlasName, L"languagebarrier/fonts/font_%02d.dds", it->first);
+      _wremove(atlasName);
+      wsprintf(atlasName, L"languagebarrier/fonts/outline_%02d.dds", it->first);
+      _wremove(atlasName);
       it = this->fontData.erase(it);
     } else
       ++it;
@@ -414,8 +484,30 @@ void TextRendering::loadCache() {
     try {
       archive(this->fontData);
 
+      bool charsetMismatch = false;
       for (auto it = fontData.begin(); it != fontData.end(); it++) {
-        if (it->second.lang != TextRendering::Get().language) {
+        if (it->second.charsetHash != 0 &&
+            it->second.charsetHash != TextRendering::Get().charsetHash) {
+          charsetMismatch = true;
+          break;
+        }
+      }
+      if (charsetMismatch) {
+        lb::LanguageBarrierLog(
+            "Font cache was baked from a different charset, clearing font cache");
+        fontData.clear();
+        TextRendering::Get().saveCache();
+        return;
+      }
+
+      for (auto it = fontData.begin(); it != fontData.end(); it++) {
+        // With forceIncludeHan the charset no longer depends on the language
+        // (every Han glyph is kept in both), so a cache baked under one
+        // language is identical to one baked under the other and the check
+        // would only throw away a perfectly good cache -- e.g. a pre-baked
+        // seed shipped in the patch, which must serve JP and EN alike.
+        if (!TextRendering::Get().forceIncludeHan &&
+            it->second.lang != TextRendering::Get().language) {
           lb::LanguageBarrierLog(
               "Font cache language mismatch, clearing font cache");
 
@@ -431,7 +523,10 @@ void TextRendering::loadCache() {
             fileName, DirectX::DDS_FLAGS::DDS_FLAGS_NONE, nullptr,
             this->fontData[size].fontTexture);
         if (g != S_OK) {
+          lb::LanguageBarrierLog(
+              "Font cache is missing its baked atlas, clearing font cache");
           this->fontData.clear();
+          TextRendering::Get().saveCache();
           return;
         }
         wsprintf(fileName, L"languagebarrier/fonts/outline_%02d.dds",
@@ -440,8 +535,10 @@ void TextRendering::loadCache() {
             fileName, DirectX::DDS_FLAGS::DDS_FLAGS_NONE, nullptr,
             this->fontData[size].outlineTexture);
         if (g != S_OK) {
+          lb::LanguageBarrierLog(
+              "Font cache is missing its baked outline atlas, clearing font cache");
           this->fontData.clear();
-
+          TextRendering::Get().saveCache();
           return;
         }
         const auto fontData = &this->fontData[size];
@@ -480,6 +577,27 @@ void TextRendering::loadCache() {
   return;
 }
 
+// Quoting brackets are full-width in the source font, but their ink only fills
+// the right half of that cell (measured: 13px of ink inside a 40px advance at
+// size 40, with 26px of blank to its left). Two things follow, and both are
+// fixed by the same change:
+//
+//   * a line that wraps starts at the block's left edge, so its first glyph
+//     lands next to the *blank* half of the previous line's bracket and the
+//     block reads ragged;
+//   * the bracket looks like it is standing a full character away from the
+//     text it opens.
+//
+// Narrowing the step to half an em and pulling the ink to the cell's left edge
+// gives the brackets a half-width feel. The layout table is patched to match
+// (see TextRendering::Init) so wrapping still agrees with what gets drawn --
+// quotes sit past the first 351 cells, which the existing width pass never
+// reached.
+static bool isNarrowQuote(wchar_t c) {
+  return c == 0x300C || c == 0x300D ||  // 「 」
+         c == 0x300E || c == 0x300F;    // 『 』
+}
+
 void TextRendering::renderGlyph(FontData* fontData, uint16_t n, bool measure) {
   FT_Long glyph_index;
   FT_Glyph glyph;
@@ -515,6 +633,11 @@ void TextRendering::renderGlyph(FontData* fontData, uint16_t n, bool measure) {
   glyphData->width = face->glyph->bitmap.width;
   glyphData->left = face->glyph->bitmap_left;
   glyphData->top = face->glyph->bitmap_top;
+  if (this->narrowQuotes && isNarrowQuote((wchar_t)n)) {
+    glyphData->advance =
+        (uint16_t)(this->quoteWidth32 * fontData->size / 32.0f);
+    glyphData->left = (int32_t)(this->quoteInset32 * fontData->size / 32.0f);
+  }
   if (!measure) {
     glyphData->data = new uint8_t[FONT_CELL_SIZE * FONT_CELL_SIZE];
     memset(glyphData->data, 0, FONT_CELL_SIZE * FONT_CELL_SIZE);
@@ -545,6 +668,11 @@ void TextRendering::RenderOutline(FontData* fontData, uint16_t n,
   glyphData->width = bitmapGlyph->bitmap.width;
   glyphData->left = bitmapGlyph->left;
   glyphData->top = bitmapGlyph->top;
+  // Same shift as the fill: the outline is positioned by this value too, so a
+  // narrowed quote whose outline kept the old bearing would show a double edge.
+  if (this->narrowQuotes && isNarrowQuote((wchar_t)n)) {
+    glyphData->left = (int32_t)(this->quoteInset32 * fontData->size / 32.0f);
+  }
   int diff =
       (glyphData->width - fontData->getGlyphInfoByChar(n, Regular)->width);
   glyphData->advance = face->glyph->advance.x / 64 + diff;
@@ -566,7 +694,6 @@ void TextRendering::RenderOutline(FontData* fontData, uint16_t n,
   FT_Done_Glyph(glyph);
 }
 FontData* TextRendering::getFont(int height, bool measure) {
-  if (!enabled) return nullptr;
   this->FONT_CELL_SIZE = height * 1.33;
   if (fontData.find(height) == fontData.end()) {
     fontData[height] = FontData();
@@ -647,18 +774,30 @@ FontGlyph* FontData::getGlyphInfoByChar(wchar_t character, FontType type) {
   }
 }
 FontGlyph* FontData::getGlyphInfo(int id, FontType type) {
+  TextRendering& textRendering = TextRendering::Get();
+  wchar_t character = textRendering.getCharForGlyphId(id);
+  // A referenced id can resolve to a character the font has no glyph for (it is
+  // then absent from glyphMap). Returning missingGlyph draws nothing instead of
+  // letting map::at throw out_of_range on the game's render thread.
+  FontGlyph* fallback = &textRendering.missingGlyph;
+
   switch (type) {
-    case Regular:
-      return &this->glyphData.glyphMap.at(TextRendering::Get().fullCharMap[id]);
-      break;
-    case Outline:
-      return &this->glyphData.outlineMap.at(
-          TextRendering::Get().fullCharMap[id]);
-      break;
-    case Italics:
-      return &this->glyphData.glyphMap.at(TextRendering::Get().fullCharMap[id]);
-      break;
+    case Regular: {
+      auto it = this->glyphData.glyphMap.find(character);
+      if (it != this->glyphData.glyphMap.end()) return &it->second;
+      return fallback;
+    }
+    case Outline: {
+      auto it = this->glyphData.outlineMap.find(character);
+      if (it != this->glyphData.outlineMap.end()) return &it->second;
+      return fallback;
+    }
+    case Italics: {
+      auto it = this->glyphData.glyphMap.find(character);
+      if (it != this->glyphData.glyphMap.end()) return &it->second;
+      return fallback;
+    }
     default:
-      break;
+      return fallback;
   }
 }

@@ -121,12 +121,16 @@ struct FontData {
   ID3D11Texture2D* outlineTexturePtr;
   ID3D11ShaderResourceView* outlineShaderRscView;
   FontDataLanguage lang = EN;
+  // Fingerprint of the charset this FontData was baked from. A stale cache baked
+  // under a different charset would place glyphs in different cells, so the hash
+  // is checked on load and the cache is discarded on mismatch.
+  uint32_t charsetHash = 0;
 
   FontGlyph* getGlyphInfo(int id, FontType type);
   FontGlyph* getGlyphInfoByChar(wchar_t character, FontType type);
   template <class Archive>
   void serialize(Archive& ar) {
-    ar(lang, glyphData);
+    ar(lang, charsetHash, glyphData);
   }
 };
 
@@ -139,6 +143,17 @@ struct TextRendering {
   int NUM_GLYPHS = 351;
   std::string fontPath;
   bool enabled = false;
+  // forceIncludeHan (patchdef) keeps every renderable glyph in the charset
+  // regardless of the game language, so a cache baked under JP is
+  // byte-for-byte the same as one baked under EN. When it is on, loadCache
+  // skips its language check and one cache serves both.
+  bool forceIncludeHan = false;
+  // Quoting brackets (「」『』): drawn at a half-width step with their ink pulled
+  // to the cell's left edge, instead of full-width with the ink in the right
+  // half. Widths are in the same 32 = 1em units the layout table uses.
+  bool narrowQuotes = true;
+  uint16_t quoteWidth32 = 16;  // half an em
+  uint16_t quoteInset32 = 3;   // ink inset from the cell's left edge
   void disableReplacement();
   void enableReplacement();
   TextRendering();
@@ -150,7 +165,6 @@ struct TextRendering {
   uint8_t* widthData;
   uint8_t* widthData2;
   void Init(void* widthData, void* widthData2, FontDataLanguage language);
-  void LoadCharset();
   void buildFont(int fontSize, bool measure);
 
   void initFT(int fontSize);
@@ -165,6 +179,14 @@ struct TextRendering {
   std::wstring filteredCharMap;
   std::wstring fullCharMap;
   std::wstring* currentCharMap;
+  // Returned when a referenced glyph id resolves to a character that was never
+  // baked (its codepoint is missing from the font). It has width 0 and draws
+  // nothing, which is the right outcome for a glyph the font cannot supply.
+  FontGlyph missingGlyph;
+
+  // FNV-1a over fullCharMap; identifies the charset a font cache was baked from.
+  uint32_t charsetHash = 0;
+  static uint32_t computeCharsetHash(const std::wstring& charset);
 
   inline static TextRendering& Get() {
     static TextRendering instance;
@@ -175,6 +197,9 @@ struct TextRendering {
   void RenderOutline(FontData* fontData, uint16_t n, bool measure);
 
   FontData* getFont(int height, bool measure);
+  // Charset character for a glyph id; ids outside the charset map to a space
+  // rather than reading out of bounds.
+  wchar_t getCharForGlyphId(int glyphId) const;
 
   void replaceFontSurface(int size);
   int SurfacePointSize[512];

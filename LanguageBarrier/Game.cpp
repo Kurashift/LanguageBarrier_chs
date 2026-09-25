@@ -2,6 +2,7 @@
 #include "Game.h"
 #include <d3d9.h>
 #include <fstream>
+#include <cstdio>
 #include <map>
 #include <string>
 #include <vector>
@@ -42,10 +43,6 @@ typedef int(__cdecl* MountArchiveRNDProc)(int id, const char* mountPoint,
                                           int unk01, int unk02, int unk03);
 static MountArchiveRNDProc gameExeMountArchiveRND = NULL;
 static MountArchiveRNDProc gameExeMountArchiveRNDReal = NULL;
-
-typedef int(__fastcall * MountArchiveSGEProc)(int id, const char* archiveName);
-static MountArchiveSGEProc gameExeMountArchiveSGE = NULL;
-static MountArchiveSGEProc gameExeMountArchiveSGEReal = NULL;
 
 typedef int(__thiscall* CloseAllSystemsProc)(void* pThis);
 static CloseAllSystemsProc gameExeCloseAllSystems = NULL;
@@ -275,7 +272,13 @@ typedef int(__thiscall* ReadOggMetadataProc)(CPlayer* pThis);
 static ReadOggMetadataProc gameExeReadOggMetadata = NULL;
 static ReadOggMetadataProc gameExeReadOggMetadataReal = NULL;
 
-MgsD3D9State* gameExePMgsD3D9State = NULL;
+struct __declspec(align(4)) MgsD3D9State {
+  IDirect3DSurface9* backbuffer;
+  int field_4;
+  int field_8;
+  IDirect3DDevice9Ex* device;
+};
+static MgsD3D9State* gameExePMgsD3D9State = NULL;
 MgsD3D11State* gameExePMgsD3D11State = NULL;
 
 static IDirect3D9Ex** gameExePpD3D9Ex = NULL;
@@ -300,7 +303,7 @@ int* gameExeScrWork = (int*)NULL;
 
 namespace lb {
 
-GameID SurfaceWrapper::game = GameID::SG;
+int SurfaceWrapper::game = 0;
 
 int __cdecl earlyInitHook(int unk0, int unk1);
 int __fastcall mpkFopenByIdHook(void* pThis, void* EDX, mpkObject* mpk,
@@ -323,7 +326,84 @@ int __cdecl mountArchiveHookRNE(int id, const char* mountPoint,
                                 const char* archiveName, int unk01);
 int __cdecl mountArchiveHookRND(int id, const char* mountPoint, int unk01,
                                 int unk02, int unk03);
-int __fastcall mountArchiveHookSGE(int id, const char* archiveName);
+
+// The title menu draws its selection cursor (and click area) at a per-row
+// width taken from a 15-entry table in .data. The English release baked the
+// English label widths in; the localized menu atlas draws the row boxes at
+// Chinese widths, so this table has to be rewritten to match or the cursor
+// keeps the English length. The address comes from the absolute operand of
+// `mov ecx, [reg*4 + table]` in .text; the loader relocates that operand, so
+// dereferencing it at runtime is ASLR-safe.
+static const uint32_t kTitleRowWidthsEn[15] = {333, 262, 186, 198, 151, 311,
+                                               287, 299, 384, 365, 240, 321,
+                                               366, 150, 261};
+// Must equal the box widths of the localized title_chip_pc atlas
+// (see title_chip_pc_zh.records.json: box_w = advance + 37).
+static const uint32_t kTitleRowWidthsZh[15] = {169, 169, 169, 103, 103, 169,
+                                               169, 146, 169, 169, 178, 136,
+                                               169, 103, 169};
+
+static void titleMenuWidthsInit() {
+  if (config["patch"].count("localizedTitleMenuWidths") == 1 &&
+      config["patch"]["localizedTitleMenuWidths"].get<bool>() == false)
+    return;
+  uintptr_t table = sigScan("game", "useOfTitleMenuRowWidths");
+  if (table == NULL) {
+    LanguageBarrierLog("TitleMenuWidths: signature not found; left as-is");
+    return;
+  }
+  uint32_t current[15];
+  memcpy(current, (const void*)table, sizeof(current));
+  if (memcmp(current, kTitleRowWidthsEn, sizeof(current)) != 0) {
+    LanguageBarrierLog("TitleMenuWidths: unexpected table content; left as-is");
+    return;
+  }
+  if (memcmp(current, kTitleRowWidthsZh, sizeof(current)) == 0) return;
+  memcpy_perms((void*)table, kTitleRowWidthsZh, sizeof(kTitleRowWidthsZh));
+  LanguageBarrierLog("TitleMenuWidths: patched to localized widths");
+}
+
+// The window title is an ASCII literal in .rdata that the game copies into a
+// std::string and passes as both lpClassName and lpWindowName of
+// CreateWindowExA. The executable spells the product "DASH" while it is
+// actually "DaSH", and since the literal is only ever read, rewriting it in
+// place during init (long before the window exists) fixes the title without a
+// hook. The signature *is* the original string, so a match already proves the
+// buffer holds it.
+static const char kWindowTitleOriginal[] = "Robotics;Notes DASH";
+
+static void windowTitleInit() {
+  if (config["patch"].count("windowTitle") == 0) return;
+  const std::string title = config["patch"]["windowTitle"].get<std::string>();
+  if (title.empty()) return;
+
+  uintptr_t literal = sigScan("game", "windowTitle", true);
+  if (literal == NULL) {
+    LanguageBarrierLog("WindowTitle: signature not found; left as-is");
+    return;
+  }
+
+  // The game builds the name as std::string(literal, 19) and hands that same
+  // object to CreateWindowExA as both the class name and the window name, so
+  // the replacement may be shorter (pad with NULs to keep the two in sync) but
+  // never longer: the save-directory path is stored directly behind the
+  // literal and must not be overwritten.
+  const size_t kTitleLen = sizeof(kWindowTitleOriginal) - 1;
+  if (title.size() > kTitleLen) {
+    LanguageBarrierLog("WindowTitle: replacement too long; left as-is");
+    return;
+  }
+
+  char patched[sizeof(kWindowTitleOriginal)];
+  memcpy(patched, kWindowTitleOriginal, sizeof(patched));
+  memcpy(patched, title.c_str(), title.size());
+  memset(patched + title.size(), '\0', kTitleLen - title.size());
+  patched[kTitleLen] = '\0';
+
+  memcpy_perms((void*)literal, patched, sizeof(patched));
+  LanguageBarrierLog("WindowTitle: patched to \"" + title + "\"");
+}
+
 void gameInit() {
   SetProcessDPIAware();
   std::ifstream in("languagebarrier\\stringReplacementTable.bin",
@@ -335,12 +415,7 @@ void gameInit() {
   in.close();
 
   globalTextReplacementsInit();
-  if (config["gamedef"].count("gameVideoMiddleware") &&
-      config["gamedef"]["gameVideoMiddleware"].get<std::string>() == "cri") {
-    criManaModInit();
-  } else {
-    binkModInit();
-  }
+
   gameExeTextureLoadInit1 = sigScan("game", "textureLoadInit1");
   gameExeTextureLoadInit2 = sigScan("game", "textureLoadInit2");
   gameExeGslPngload = sigScan("game", "gslPngload");
@@ -358,40 +433,28 @@ void gameInit() {
   if (config["gamedef"]["signatures"]["game"].count("useOfPShouldPlayBgm") == 1)
     gameExePShouldPlayBgm = sigScan("game", "useOfPShouldPlayBgm");
 
-  if (true) {
-    if (config["gamedef"].count("gameArchiveMiddleware") == 1 &&
-        config["gamedef"]["gameArchiveMiddleware"].get<std::string>() ==
-            "cri") {
-      if (config["gamedef"]["signatures"]["game"].count("mountArchiveRNE") ==
-          1) {
-        if (!scanCreateEnableHook("game", "mountArchiveRNE",
-                                  (uintptr_t*)&gameExeMountArchiveRNE,
-                                  (LPVOID)mountArchiveHookRNE,
-                                  (LPVOID*)&gameExeMountArchiveRNEReal))
-          return;
-      } else if (config["gamedef"]["signatures"]["game"].count(
-                     "mountArchiveRND") == 1) {
-        if (!scanCreateEnableHook("game", "mountArchiveRND",
-                                  (uintptr_t*)&gameExeMountArchiveRND,
-                                  (LPVOID)mountArchiveHookRND,
-                                  (LPVOID*)&gameExeMountArchiveRNDReal))
-          return;
-      } else if (config["gamedef"]["signatures"]["game"].count(
-                     "mountArchiveSGE") == 1) {
-        lb::SurfaceWrapper::game = SGE;
-
-        if (!scanCreateEnableHook("game", "mountArchiveSGE",
-                                  (uintptr_t*)&gameExeMountArchiveSGE,
-                                  (LPVOID)mountArchiveHookSGE,
-                                  (LPVOID*)&gameExeMountArchiveSGEReal))
-          return;
-      }
-    } else {
-      gameExeMpkMount = sigScan("game", "mpkMount");
-      gameExeMpkConstructor =
-          (MpkConstructorProc)sigScan("game", "mpkConstructor");
+  if (config["gamedef"].count("gameArchiveMiddleware") == 1 &&
+      config["gamedef"]["gameArchiveMiddleware"].get<std::string>() == "cri") {
+    if (config["gamedef"]["signatures"]["game"].count("mountArchiveRNE") == 1) {
+      if (!scanCreateEnableHook("game", "mountArchiveRNE",
+                                (uintptr_t*)&gameExeMountArchiveRNE,
+                                (LPVOID)mountArchiveHookRNE,
+                                (LPVOID*)&gameExeMountArchiveRNEReal))
+        return;
+    } else if (config["gamedef"]["signatures"]["game"].count(
+                   "mountArchiveRND") == 1) {
+      if (!scanCreateEnableHook("game", "mountArchiveRND",
+                                (uintptr_t*)&gameExeMountArchiveRND,
+                                (LPVOID)mountArchiveHookRND,
+                                (LPVOID*)&gameExeMountArchiveRNDReal))
+        return;
     }
+  } else {
+    gameExeMpkMount = sigScan("game", "mpkMount");
+    gameExeMpkConstructor =
+        (MpkConstructorProc)sigScan("game", "mpkConstructor");
   }
+
   gameExeGetFlag = (GetFlagProc)sigScan("game", "getFlag");
   gameExeSetFlag = (SetFlagProc)sigScan("game", "setFlag");
   gameExeChkViewDic = (ChkViewDicProc)sigScan("game", "chkViewDic");
@@ -399,6 +462,9 @@ void gameInit() {
   scanCreateEnableHook("game", "recreateDDSSurface",
                        (uintptr_t*)&gameExeGslDDSload,
                        (LPVOID)ReCreateLoadTextureDDS, NULL);
+
+  scanCreateEnableHook("game", "openMyGames", (uintptr_t*)&gameExeOpenMyGames,
+                       (LPVOID)openMyGamesHook, NULL);
 
   // TODO: fault tolerance - we don't need to call it quits entirely just
   // because one *feature* can't work
@@ -412,24 +478,20 @@ void gameInit() {
       !scanCreateEnableHook("game", "clibFopen", (uintptr_t*)&gameExeClibFopen,
                             (LPVOID)clibFopenHook,
                             (LPVOID*)&gameExeClibFopenReal))
-
-    scanCreateEnableHook("game", "openMyGames", (uintptr_t*)&gameExeOpenMyGames,
-                         (LPVOID)openMyGamesHook, NULL);
+    return;
 
   scanCreateEnableHook("game", "openFile", (uintptr_t*)&gameExeOpenFile,
                        (LPVOID)openFileHook, (LPVOID*)&gameExeOpenFileReal);
 
   memoryManagementInit();
+  scriptInit();
 
-  if (lb::SurfaceWrapper::game != SGE) {
-    scriptInit();
-    if (config["gamedef"]["gameDxVersion"].get<std::string>() == "dx9") {
-      gameExePMgsD3D9State =
-          *((MgsD3D9State**)sigScan("game", "useOfMgsD3D9State"));
-      gameExePpD3D9Ex = *((IDirect3D9Ex***)sigScan("game", "useOfD3D9Ex"));
-      gameExePPresentParameters =
-          *((D3DPRESENT_PARAMETERS**)sigScan("game", "useOfPresentParameters"));
-    }
+  if (config["gamedef"]["gameDxVersion"].get<std::string>() == "dx9") {
+    gameExePMgsD3D9State =
+        *((MgsD3D9State**)sigScan("game", "useOfMgsD3D9State"));
+    gameExePpD3D9Ex = *((IDirect3D9Ex***)sigScan("game", "useOfD3D9Ex"));
+    gameExePPresentParameters =
+        *((D3DPRESENT_PARAMETERS**)sigScan("game", "useOfPresentParameters"));
   }
 
   if (config["patch"]["textureFiltering"].get<bool>() == true) {
@@ -480,30 +542,39 @@ void gameInit() {
             (LPVOID)SNDgetPlayLevelHook, (LPVOID*)&gameExeSNDgetPlayLevelReal))
       return;
   }
-    gameExeScriptIdsToFileIds =
-        (int*)sigScan("game", "useOfScriptIdsToFileIds");
-    if (config["gamedef"]["signatures"]["game"].count("useOfAudioPlayers") == 1)
-      gameExeAudioPlayers = *(CPlayer**)sigScan("game", "useOfAudioPlayers");
-    if (config["gamedef"]["signatures"]["game"].count("useOfMpkObjects") == 1)
-      gameExeMpkObjects = (mpkObject*)sigScan("game", "useOfMpkObjects");
-    if (config["gamedef"]["signatures"]["game"].count("useOfFileObjects") == 1)
-      gameExeFileObjects = (mgsVFSObject*)sigScan("game", "useOfFileObjects");
 
-    if (config["patch"].value<bool>("disableUnconfiguredControllers", true)) {
-      gameExeControllerGuid = sigScan("game", "useOfControllerGuid");
-      if (gameExeControllerGuid != NULL) {  // signatures present
-        scanCreateEnableHook(
-            "game", "PadUpdateDevice", (uintptr_t*)&gameExePadUpdateDevice,
-            (LPVOID)PadUpdateDeviceHook, (LPVOID*)&gameExePadUpdateDeviceReal);
-      }
+  gameExeScriptIdsToFileIds = (int*)sigScan("game", "useOfScriptIdsToFileIds");
+  if (config["gamedef"]["signatures"]["game"].count("useOfAudioPlayers") == 1)
+    gameExeAudioPlayers = *(CPlayer**)sigScan("game", "useOfAudioPlayers");
+  if (config["gamedef"]["signatures"]["game"].count("useOfMpkObjects") == 1)
+    gameExeMpkObjects = (mpkObject*)sigScan("game", "useOfMpkObjects");
+  if (config["gamedef"]["signatures"]["game"].count("useOfFileObjects") == 1)
+    gameExeFileObjects = (mgsVFSObject*)sigScan("game", "useOfFileObjects");
 
-
-    if (config["patch"].count("overrideAreaParams")) {
+  if (config["patch"].value<bool>("disableUnconfiguredControllers", true)) {
+    gameExeControllerGuid = sigScan("game", "useOfControllerGuid");
+    if (gameExeControllerGuid != NULL) {  // signatures present
       scanCreateEnableHook(
-          "game", "setAreaParams", (uintptr_t*)&gameExeSetAreaParams,
-          (LPVOID)setAreaParamsHook, (LPVOID*)&gameExeSetAreaParamsReal);
+          "game", "PadUpdateDevice", (uintptr_t*)&gameExePadUpdateDevice,
+          (LPVOID)PadUpdateDeviceHook, (LPVOID*)&gameExePadUpdateDeviceReal);
     }
   }
+
+  if (config["gamedef"].count("gameVideoMiddleware") &&
+      config["gamedef"]["gameVideoMiddleware"].get<std::string>() == "cri") {
+    criManaModInit();
+  } else {
+    binkModInit();
+  }
+
+  if (config["patch"].count("overrideAreaParams")) {
+    scanCreateEnableHook(
+        "game", "setAreaParams", (uintptr_t*)&gameExeSetAreaParams,
+        (LPVOID)setAreaParamsHook, (LPVOID*)&gameExeSetAreaParamsReal);
+  }
+
+  titleMenuWidthsInit();
+  windowTitleInit();
 }
 
 // earlyInit is called after all the subsystems have been initialised but before
@@ -549,14 +620,6 @@ int __cdecl earlyInitHook(int unk0, int unk1) {
                      "mountArchiveRND") == 1) {
         gameExeMountArchiveRNDReal(C0DATA_MOUNT_ID, "languagebarrier\\c0data",
                                    0, 1, 0);
-      } else if (config["gamedef"]["signatures"]["game"].count(
-                     "mountArchiveSGE") == 1) {
-        C0DATA_MOUNT_ID++;
-        gameExeMountArchiveSGEReal(C0DATA_MOUNT_ID, "..\\languagebarrier\\c0data");
-        const int SGE_SCRIPT_ID = 3;
-        gameExeMountArchiveSGEReal(SGE_SCRIPT_ID,
-                                   "..\\languagebarrier\\enscript");
-
       }
       LanguageBarrierLog("c0data mounted");
 
@@ -694,10 +757,6 @@ std::string mountArchiveHookPart(const char* mountPoint) {
   return mountPoint;
 }
 
-int __fastcall mountArchiveHookSGE(int id, const char* archiveFile) {
-  return gameExeMountArchiveSGEReal(id, archiveFile);
-}
-
 int __cdecl mountArchiveHookRNE(int id, const char* mountPoint,
                                 const char* archiveName, int unk01) {
   std::string path = mountArchiveHookPart(mountPoint);
@@ -722,6 +781,30 @@ int __fastcall mgsFileOpenHook(mgsFileLoader* pThis, void* dummy, int unused) {
 #ifdef _DEBUG
     LanguageBarrierLog(logstr.str());
 #endif
+
+    // fileIdRemap: re-point a request at a DIFFERENT file inside the SAME
+    // archive -- no file is shipped. Used where the wanted asset already exists
+    // in the game's own data (e.g. the alternate character models are the ones
+    // the game itself stores in `model.cpk`), which keeps the patch small and
+    // avoids redistributing game assets. `fileRedirection` (copy into c0data)
+    // still applies when there is no remap entry, so both can coexist.
+    if (config["patch"].count("fileIdRemap") == 1 &&
+        config["patch"]["fileIdRemap"].count(archiveName) > 0) {
+      std::string rkey = (fileId == -1) ? std::string(fileName)
+                                        : std::to_string(fileId);
+      if (config["patch"]["fileIdRemap"][archiveName].count(rkey) == 1) {
+        int newFileId = config["patch"]["fileIdRemap"][archiveName][rkey].get<int>();
+        logstr << " remapped in " << archiveName << " to 0x" << std::hex << newFileId;
+#ifdef _DEBUG
+        LanguageBarrierLog(logstr.str());
+#endif
+
+        pThis->fileId = newFileId;
+        if (fileId == -1) pThis->loadMode = 2;
+        return gameExeMgsFileOpenReal(pThis, unused);
+      }
+    }
+
     if (config["patch"].count("fileRedirection") == 1 &&
         config["patch"]["fileRedirection"].count(archiveName) > 0) {
       std::string key;
@@ -732,6 +815,15 @@ int __fastcall mgsFileOpenHook(mgsFileLoader* pThis, void* dummy, int unused) {
       }
       if (config["patch"]["fileRedirection"][archiveName].count(key) == 1) {
         auto red = config["patch"]["fileRedirection"][archiveName][key];
+        // A language-conditional entry is an object {"jp": id, "en": id}, for
+        // assets the two languages lay out differently. The EXTRA screen is one:
+        // it draws its stat numbers at language-specific x, each aligned to its
+        // own original atlas's separators, so one atlas cannot serve both.
+        if (red.is_object()) {
+          const char* langKey =
+              (gameExeLanguage && *gameExeLanguage != 0) ? "en" : "jp";
+          if (red.count(langKey) == 1) red = red[langKey];
+        }
         if (red.type() == json::value_t::number_integer ||
             red.type() == json::value_t::number_unsigned) {
           int newFileId = red.get<int>();
@@ -739,6 +831,7 @@ int __fastcall mgsFileOpenHook(mgsFileLoader* pThis, void* dummy, int unused) {
 #ifdef _DEBUG
           LanguageBarrierLog(logstr.str());
 #endif
+
           pThis->fileId = newFileId;
           pThis->vfsObject = c0dataCpk;
           if (fileId == -1) pThis->loadMode = 2;
