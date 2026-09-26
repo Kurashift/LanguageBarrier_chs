@@ -1,22 +1,25 @@
-# RND 简体中文汉化 fork 说明
+# FORK-NOTES —— ROBOTICS;NOTES DaSH 简体中文汉化专用改版
 
-本仓库是 [CommitteeOfZero/LanguageBarrier](https://github.com/CommitteeOfZero/LanguageBarrier)
-的 fork，用于 **ROBOTICS;NOTES DaSH 简体中文汉化补丁**
-（[Syun1524/RND_Chinese](https://github.com/Syun1524/RND_Chinese)）。
+**本目录（`LanguageBarrier_chs/`）是为机器人笔记 DaSH 汉化改过的版本，不是上游原件。**
 
-## 基准
+| | |
+|---|---|
+| **用途** | **ROBOTICS;NOTES DaSH**（MAGES/5pb，Steam 版）**简体中文汉化补丁**的运行时 |
+| **汉化项目** | [Syun1524/RND_Chinese](https://github.com/Syun1524/RND_Chinese) |
+| **fork 自** | [CommitteeOfZero/LanguageBarrier](https://github.com/CommitteeOfZero/LanguageBarrier) |
+| **基准提交** | `cc982fd9`（2025-04-27，"Fix time stamp rendering"） |
+| **本分支** | `rnd-chinese` |
+| **改动规模** | **13 个文件，+1667 / −1064 行** |
 
-fork 自上游 **`cc982fd9`**（2025-04-27，"Fix time stamp rendering"）。
-本分支 `rnd-chinese` 的改动全部叠加在该提交之上，
-因此 `git diff cc982fd9` 即为本项目的完整改动集。
+- 独立 fork 仓库：<https://github.com/Kurashift/LanguageBarrier_chs>（分支 `rnd-chinese`）
+- `git diff cc982fd9` 即为本项目的完整改动集
+- **上游原件请用 [CommitteeOfZero 的仓库](https://github.com/CommitteeOfZero/LanguageBarrier)** ——
+  本 fork 服务中文汉化，不保证与上游同步
 
-> 上游在此之后新增了 `Hooking.*` / `NewHooks.*` / `ScriptDebugger.*` /
-> `cryptbase.*` 等文件（大重构）。本项目基于较早版本，**尚未跟进** ——
-> 那批改动与中文汉化无关，合并需单独评估。
+> 上游此后新增了 `Hooking.*` / `NewHooks.*` / `ScriptDebugger.*` / `cryptbase.*`
+> 等文件（大重构），**本 fork 尚未跟进** —— 那批改动与中文汉化无关，合并需单独评估。
 
-## 改动概要
-
-`git diff cc982fd9 --stat` 的结果：**13 个文件，+1667 / −1064 行**。
+## 改了什么
 
 主要方向（按文件）：
 
@@ -30,7 +33,7 @@ fork 自上游 **`cc982fd9`**（2025-04-27，"Fix time stamp rendering"）。
 | `CriManaMod.cpp` | 影片字幕（中文卡拉OK + 翻译轨）相关调整 |
 | `LanguageBarrier.vcxproj` | 构建配置（新增 `RubyBaseTable.inc` 等） |
 
-`RubyBaseTable.inc` 是**生成文件**（由工作区的 `scripts/gen_ruby_base_table.py`
+`RubyBaseTable.inc` 是**生成文件**（由汉化仓库的 `scripts/gen_ruby_base_table.py`
 从已部署 enscript 提取），用于对话框注音的水平定位。
 
 ## 构建
